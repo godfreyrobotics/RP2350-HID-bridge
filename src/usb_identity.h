@@ -1,0 +1,24 @@
+#ifndef USB_IDENTITY_H
+#define USB_IDENTITY_H
+
+#ifndef USB_MANUFACTURER_STRING
+#define USB_MANUFACTURER_STRING "Godfrey"
+#endif
+
+#ifndef USB_CONTROL_PRODUCT_STRING
+#define USB_CONTROL_PRODUCT_STRING "USB Bridge Control"
+#endif
+
+#ifndef USB_POINTER_PRODUCT_STRING
+#define USB_POINTER_PRODUCT_STRING "USB Bridge Pointer"
+#endif
+
+#ifndef USB_INTERFACE_STRING
+#define USB_INTERFACE_STRING "Command Port"
+#endif
+
+#ifndef USB_SHARED_SERIAL_STRING
+#define USB_SHARED_SERIAL_STRING "BRIDGE0001"
+#endif
+
+#endif
