@@ -465,16 +465,11 @@ This helps prevent stuck keys, stuck modifiers, or stuck mouse buttons if the co
 ## Current limitations
 
 - Pointer movement is **relative-only** in firmware
-- Firmware-side absolute movement is intentionally not implemented
 - Standard 6-key boot keyboard behavior only
-- No NKRO
-- Placeholder VID/PIDs are currently used for development
 - Higher-level macros and motion planning are intended to live on the controller computer, not in firmware
 
 ## Future work
 
-- Consumer control support
-- System control support
 - Controller-side macro layer
 - Integration with computer vision / autonomous control loops
 
