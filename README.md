@@ -27,7 +27,8 @@ For development and testing, the HID output can also be plugged back into the **
 ### Mouse
 
 - Relative mouse movement
-- Smooth relative mouse movement
+- Preemptive motion commands: new motion commands interrupt older active motion plans
+- Preemptive motion commands
 - Button press / release
 - Click and double click
 - Drag operations
@@ -182,7 +183,7 @@ RESET
 
 ### `MOVE dx dy`
 
-Performs immediate relative mouse movement.
+Performs immediate relative mouse movement. This command is **preemptive**: it cancels any active smooth motion or drag plan before applying the new movement.
 
 Parameters:
 
@@ -197,7 +198,7 @@ MOVE 100 0
 
 ### `MOVE_SMOOTH dx dy duration_ms steps [curve] [overshoot] [jitter] [timing_jitter] [final_correct]`
 
-Performs smooth relative movement over time.
+Performs smooth relative movement over time. This command is **preemptive**: it cancels any active smooth motion or drag plan before applying the new movement.
 
 Parameters:
 
@@ -219,7 +220,7 @@ MOVE_SMOOTH 300 0 1000 40
 
 ### `DRAG button dx dy duration_ms steps [curve] [overshoot] [jitter] [timing_jitter] [final_correct]`
 
-Holds a mouse button and performs smooth relative movement.
+Holds a mouse button and performs smooth relative movement. This command is **preemptive**: it cancels any active smooth motion or drag plan before applying the new movement.
 
 Parameters:
 
@@ -231,6 +232,13 @@ Example:
 ```text
 DRAG 1 250 0 1000 40
 ```
+
+#### `CANCEL_MOTION`
+
+Cancels the active motion plan immediately.
+
+```text
+CANCEL_MOTION
 
 ### `CLICK button [count] [interval_ms] [hold_ms] [interval_jitter_ms] [hold_jitter_ms]`
 
@@ -458,6 +466,8 @@ This firmware is designed to fail in a safer way than blindly holding input stat
 - If heartbeats stop, the watchdog can release active input state
 - `RESET` releases all mouse and keyboard state
 - `KEY_RESET` releases all keyboard state
+- `CANCEL_MOTION` stops active motion immediately
+- New motion commands are preemptive and replace older active motion plans
 - Mouse button state can also be cleared explicitly with `BUTTONS 0`
 
 This helps prevent stuck keys, stuck modifiers, or stuck mouse buttons if the controller software crashes or disconnects.
