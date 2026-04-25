@@ -25,7 +25,6 @@ enum {
     REPORT_ID_KEYBOARD = 0x02,
 };
 
-
 typedef struct {
     uint8_t buttons;
     int8_t x;
@@ -76,6 +75,10 @@ static action_t g_queue[ACTION_QUEUE_SIZE];
 static uint16_t g_q_head = 0;
 static uint16_t g_q_tail = 0;
 static uint32_t g_queue_deadline_ms = 0;
+static bool g_motion_owns_button = false;
+static uint8_t g_motion_owned_mask = 0;
+
+static void mouse_mark_button_state(uint8_t buttons);
 
 static inline int8_t clamp_i8(int v) {
     if (v < -127) return -127;
@@ -143,6 +146,24 @@ static void queue_clear(void) {
     g_queue_deadline_ms = 0;
 }
 
+static void release_motion_owned_button_if_needed(void) {
+    if (g_motion_owns_button && (g_mouse.buttons & g_motion_owned_mask)) {
+        mouse_mark_button_state((uint8_t)(g_mouse.buttons & (uint8_t)~g_motion_owned_mask));
+    }
+    g_motion_owns_button = false;
+    g_motion_owned_mask = 0;
+}
+
+static void preempt_motion_plan(bool release_owned_button) {
+    queue_clear();
+    if (release_owned_button) {
+        release_motion_owned_button_if_needed();
+    } else {
+        g_motion_owns_button = false;
+        g_motion_owned_mask = 0;
+    }
+}
+
 static void mouse_mark_report(uint8_t buttons, int dx, int dy, int wheel, int pan) {
     g_mouse.buttons = buttons & 0x1F;
     g_mouse.x = clamp_i8(dx);
@@ -164,6 +185,8 @@ static void mouse_release_all(void) {
     g_mouse.pan = 0;
     g_mouse.dirty = true;
     queue_clear();
+    g_motion_owns_button = false;
+    g_motion_owned_mask = 0;
 }
 
 static void keyboard_mark_dirty(void) {
@@ -511,9 +534,16 @@ static void service_cdc_rx(void) {
                 continue;
             }
 
+            if (strcmp(line, "CANCEL_MOTION") == 0) {
+                preempt_motion_plan(true);
+                cdc_write_line("OK CANCEL_MOTION");
+                continue;
+            }
+
             int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0;
 
             if (sscanf(line, "MOVE %d %d", &a, &b) == 2) {
+                preempt_motion_plan(true);
                 mouse_mark_report(g_mouse.buttons, a, b, 0, 0);
                 cdc_write_line("OK MOVE");
                 continue;
@@ -526,6 +556,8 @@ static void service_cdc_rx(void) {
             }
 
             if (sscanf(line, "BUTTONS %d", &a) == 1) {
+                g_motion_owns_button = false;
+                g_motion_owned_mask = 0;
                 mouse_mark_button_state((uint8_t)(a & 0x1F));
                 cdc_write_line("OK BUTTONS");
                 continue;
@@ -536,6 +568,8 @@ static void service_cdc_rx(void) {
                     cdc_write_line("ERR BUTTON");
                     continue;
                 }
+                g_motion_owns_button = false;
+                g_motion_owned_mask = 0;
                 mouse_mark_button_state((uint8_t)(g_mouse.buttons | button_mask(a)));
                 cdc_write_line("OK PRESS");
                 continue;
@@ -545,6 +579,10 @@ static void service_cdc_rx(void) {
                 if (!button_valid(a)) {
                     cdc_write_line("ERR BUTTON");
                     continue;
+                }
+                if (g_motion_owns_button && (g_motion_owned_mask & button_mask(a))) {
+                    g_motion_owns_button = false;
+                    g_motion_owned_mask = 0;
                 }
                 mouse_mark_button_state((uint8_t)(g_mouse.buttons & (uint8_t)~button_mask(a)));
                 cdc_write_line("OK RELEASE");
@@ -606,6 +644,7 @@ static void service_cdc_rx(void) {
                 int timing_jitter = (parsed_smooth >= 8) ? h : 1;
                 bool final_correct = (parsed_smooth >= 9) ? (i != 0) : false;
 
+                preempt_motion_plan(true);
                 bool ok = enqueue_smooth_path(g_mouse.buttons, dx, dy, duration_ms, steps,
                                               curve, overshoot, jitter, timing_jitter, final_correct);
                 cdc_write_line(ok ? "OK MOVE_SMOOTH" : "ERR QUEUE_FULL");
@@ -629,14 +668,24 @@ static void service_cdc_rx(void) {
                 if (parsed_drag < 9) timing_jitter = 1;
                 bool final_correct = (parsed_drag >= 10) ? (final_correct_i != 0) : false;
 
+                preempt_motion_plan(true);
+
                 uint8_t base_buttons = g_mouse.buttons;
                 uint8_t drag_buttons = (uint8_t)(base_buttons | button_mask(btn));
+
+                g_motion_owns_button = true;
+                g_motion_owned_mask = button_mask(btn);
 
                 bool ok = true;
                 ok &= enqueue_set_buttons_after(0, drag_buttons);
                 ok &= enqueue_smooth_path(drag_buttons, dx, dy, duration_ms, steps,
                                           curve, overshoot, jitter, timing_jitter, final_correct);
                 ok &= enqueue_set_buttons_after(1, base_buttons);
+
+                if (!ok) {
+                    g_motion_owns_button = false;
+                    g_motion_owned_mask = 0;
+                }
 
                 cdc_write_line(ok ? "OK DRAG" : "ERR QUEUE_FULL");
                 continue;
@@ -762,6 +811,10 @@ static void service_action_queue(void) {
 
         case ACT_SET_BUTTONS:
             mouse_mark_report(a.buttons, 0, 0, 0, 0);
+            if (g_motion_owns_button && !(a.buttons & g_motion_owned_mask)) {
+                g_motion_owns_button = false;
+                g_motion_owned_mask = 0;
+            }
             break;
 
         case ACT_REPORT_REL:
