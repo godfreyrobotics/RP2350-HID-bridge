@@ -3,30 +3,85 @@
 
 #include "usb_definitions.h"
 #include "usb_identity.h"
+#include "hid_modes.h"
 
-static const uint8_t pio_device_desc[] = {
+#define REPORT_ID_MOUSE       0x01
+#define REPORT_ID_KEYBOARD    0x02
+#define REPORT_ID_RADIO       0x03
+#define REPORT_ID_TELEOP_BANK 0x04
+
+static hid_mode_t g_desc_mode = HID_MODE_BRIDGE;
+
+const char *hid_mode_name(hid_mode_t mode) {
+    switch (mode) {
+        case HID_MODE_BRIDGE: return "BRIDGE";
+        case HID_MODE_RADIO:  return "RADIO";
+        case HID_MODE_TELEOP: return "TELEOP";
+        case HID_MODE_FULL:   return "FULL";
+        default:              return "UNKNOWN";
+    }
+}
+
+hid_mode_t hid_mode_from_u32(uint32_t value) {
+    if (value < HID_MODE_COUNT) return (hid_mode_t)value;
+    return HID_MODE_BRIDGE;
+}
+
+void pio_descs_set_mode(hid_mode_t mode) {
+    if (mode >= HID_MODE_COUNT) mode = HID_MODE_BRIDGE;
+    g_desc_mode = mode;
+}
+
+static const uint8_t pio_device_desc_bridge[] = {
     18, DESC_TYPE_DEVICE,
     0x00, 0x02,
-    0x00,
-    0x00,
-    0x00,
+    0x00, 0x00, 0x00,
     64,
     0xFE, 0xCA,
     0x12, 0x40,
     0x00, 0x01,
-    0x01,
-    0x02,
-    0x03,
+    0x01, 0x02, 0x03,
     0x01
 };
 
-enum {
-    REPORT_ID_MOUSE = 0x01,
-    REPORT_ID_KEYBOARD = 0x02,
+static const uint8_t pio_device_desc_radio[] = {
+    18, DESC_TYPE_DEVICE,
+    0x00, 0x02,
+    0x00, 0x00, 0x00,
+    64,
+    0xFE, 0xCA,
+    0x13, 0x40,
+    0x00, 0x01,
+    0x01, 0x02, 0x03,
+    0x01
 };
 
-static const uint8_t pio_hid_report_desc_composite[] = {
-    // Mouse report
+static const uint8_t pio_device_desc_teleop[] = {
+    18, DESC_TYPE_DEVICE,
+    0x00, 0x02,
+    0x00, 0x00, 0x00,
+    64,
+    0xFE, 0xCA,
+    0x14, 0x40,
+    0x00, 0x01,
+    0x01, 0x02, 0x03,
+    0x01
+};
+
+static const uint8_t pio_device_desc_full[] = {
+    18, DESC_TYPE_DEVICE,
+    0x00, 0x02,
+    0x00, 0x00, 0x00,
+    64,
+    0xFE, 0xCA,
+    0x15, 0x40,
+    0x00, 0x01,
+    0x01, 0x02, 0x03,
+    0x01
+};
+
+static const uint8_t pio_hid_report_desc_bridge[] = {
+    // Mouse report, same Windows-friendly shape as the baseline firmware.
     0x05, 0x01,
     0x09, 0x02,
     0xA1, 0x01,
@@ -68,7 +123,7 @@ static const uint8_t pio_hid_report_desc_composite[] = {
     0xC0,
     0xC0,
 
-    // Boot keyboard report
+    // Boot keyboard report.
     0x05, 0x01,
     0x09, 0x06,
     0xA1, 0x01,
@@ -99,41 +154,139 @@ static const uint8_t pio_hid_report_desc_composite[] = {
     0xC0
 };
 
-static const uint8_t *pio_hid_reports[] = {
-    pio_hid_report_desc_composite
+static const uint8_t pio_hid_report_desc_radio[] = {
+    // Radio-only mode: one simple joystick report, no report ID.
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x04,        // Usage (Joystick)
+    0xA1, 0x01,        // Collection (Application)
+
+    0x16, 0x01, 0x80,  // Logical Minimum (-32767)
+    0x26, 0xFF, 0x7F,  // Logical Maximum (32767)
+    0x75, 0x10,        // Report Size (16)
+    0x95, 0x08,        // Report Count (8)
+    0x05, 0x01,        // Usage Page (Generic Desktop)
+    0x09, 0x30,        // Usage (X)
+    0x09, 0x31,        // Usage (Y)
+    0x09, 0x32,        // Usage (Z)
+    0x09, 0x33,        // Usage (Rx)
+    0x09, 0x34,        // Usage (Ry)
+    0x09, 0x35,        // Usage (Rz)
+    0x09, 0x36,        // Usage (Slider)
+    0x09, 0x37,        // Usage (Dial)
+    0x81, 0x02,        // Input (Data, Variable, Absolute)
+
+    0x05, 0x09,        // Usage Page (Button)
+    0x19, 0x01,        // Usage Minimum (1)
+    0x29, 0x10,        // Usage Maximum (16)
+    0x15, 0x00,        // Logical Minimum (0)
+    0x25, 0x01,        // Logical Maximum (1)
+    0x75, 0x01,        // Report Size (1)
+    0x95, 0x10,        // Report Count (16)
+    0x81, 0x02,        // Input (Data, Variable, Absolute)
+
+    0xC0               // End Collection
 };
 
-static const uint8_t pio_config_desc[] = {
-    9,  DESC_TYPE_CONFIG,
-    34, 0,
-    1,
-    1,
-    0,
-    0xA0,
-    50,
+static const uint8_t pio_hid_report_desc_teleop[] = {
+    // Teleop-only mode: vendor-defined banked report, no report ID.
+    // Report bytes: bank, sequence, 30 x int16 axes = 62 bytes.
+    0x06, 0x00, 0xFF,  // Usage Page (Vendor Defined 0xFF00)
+    0x09, 0x01,        // Usage (Vendor Usage 1)
+    0xA1, 0x01,        // Collection (Application)
 
-    9,  DESC_TYPE_INTERFACE,
-    0,
-    0,
-    1,
-    CLASS_HID,
-    0x01,
-    0x01,
-    0,
+    0x09, 0x02,        // Usage (Bank)
+    0x15, 0x00,        // Logical Minimum (0)
+    0x25, 0x01,        // Logical Maximum (1)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x02,        // Input (Data, Variable, Absolute)
 
-    9,  DESC_TYPE_HID,
-    0x11, 0x01,
-    0x00,
-    0x01,
-    DESC_TYPE_HID_REPORT,
-    sizeof(pio_hid_report_desc_composite) & 0xFF,
-    (sizeof(pio_hid_report_desc_composite) >> 8) & 0xFF,
+    0x09, 0x03,        // Usage (Sequence)
+    0x15, 0x00,        // Logical Minimum (0)
+    0x26, 0xFF, 0x00,  // Logical Maximum (255)
+    0x75, 0x08,        // Report Size (8)
+    0x95, 0x01,        // Report Count (1)
+    0x81, 0x02,        // Input (Data, Variable, Absolute)
 
-    7,  DESC_TYPE_ENDPOINT,
-    0x81,
-    EP_ATTR_INTERRUPT,
-    8, 0,
-    10
+    0x09, 0x04,        // Usage (Axes)
+    0x16, 0x01, 0x80,  // Logical Minimum (-32767)
+    0x26, 0xFF, 0x7F,  // Logical Maximum (32767)
+    0x75, 0x10,        // Report Size (16)
+    0x95, 0x1E,        // Report Count (30)
+    0x81, 0x02,        // Input (Data, Variable, Absolute)
+
+    0xC0               // End Collection
+};
+
+static const uint8_t pio_hid_report_desc_full[] = {
+    // Experimental full mode. Useful for Linux/custom testing; not intended for Windows/game compatibility.
+    // Mouse report
+    0x05, 0x01, 0x09, 0x02, 0xA1, 0x01, 0x85, REPORT_ID_MOUSE, 0x09, 0x01, 0xA1, 0x00,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x05, 0x15, 0x00, 0x25, 0x01,
+    0x95, 0x05, 0x75, 0x01, 0x81, 0x02,
+    0x95, 0x01, 0x75, 0x03, 0x81, 0x01,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x38,
+    0x15, 0x81, 0x25, 0x7F, 0x75, 0x08, 0x95, 0x03, 0x81, 0x06,
+    0x05, 0x0C, 0x0A, 0x38, 0x02, 0x15, 0x81, 0x25, 0x7F,
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x06,
+    0xC0, 0xC0,
+
+    // Keyboard report
+    0x05, 0x01, 0x09, 0x06, 0xA1, 0x01, 0x85, REPORT_ID_KEYBOARD,
+    0x05, 0x07, 0x19, 0xE0, 0x29, 0xE7, 0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x08, 0x81, 0x02,
+    0x75, 0x08, 0x95, 0x01, 0x81, 0x01,
+    0x75, 0x08, 0x95, 0x06, 0x15, 0x00, 0x25, 0x65,
+    0x05, 0x07, 0x19, 0x00, 0x29, 0x65, 0x81, 0x00,
+    0xC0,
+
+    // Radio joystick report
+    0x05, 0x01, 0x09, 0x04, 0xA1, 0x01, 0x85, REPORT_ID_RADIO,
+    0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x08,
+    0x05, 0x01, 0x09, 0x30, 0x09, 0x31, 0x09, 0x32, 0x09, 0x33,
+    0x09, 0x34, 0x09, 0x35, 0x09, 0x36, 0x09, 0x37, 0x81, 0x02,
+    0x05, 0x09, 0x19, 0x01, 0x29, 0x10, 0x15, 0x00, 0x25, 0x01,
+    0x75, 0x01, 0x95, 0x10, 0x81, 0x02,
+    0xC0,
+
+    // Teleop bank report
+    0x06, 0x00, 0xFF, 0x09, 0x01, 0xA1, 0x01, 0x85, REPORT_ID_TELEOP_BANK,
+    0x09, 0x02, 0x15, 0x00, 0x25, 0x01, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+    0x09, 0x03, 0x15, 0x00, 0x26, 0xFF, 0x00, 0x75, 0x08, 0x95, 0x01, 0x81, 0x02,
+    0x09, 0x04, 0x16, 0x01, 0x80, 0x26, 0xFF, 0x7F, 0x75, 0x10, 0x95, 0x1E, 0x81, 0x02,
+    0xC0
+};
+
+#define CONFIG_DESC(report_desc, subclass, protocol, ep_size) \
+    9, DESC_TYPE_CONFIG, \
+    34, 0, \
+    1, 1, 0, 0xA0, 50, \
+    9, DESC_TYPE_INTERFACE, \
+    0, 0, 1, CLASS_HID, subclass, protocol, 0, \
+    9, DESC_TYPE_HID, \
+    0x11, 0x01, 0x00, 0x01, DESC_TYPE_HID_REPORT, \
+    sizeof(report_desc) & 0xFF, (sizeof(report_desc) >> 8) & 0xFF, \
+    7, DESC_TYPE_ENDPOINT, \
+    0x81, EP_ATTR_INTERRUPT, ep_size, 0, 10
+
+static const uint8_t pio_config_desc_bridge[] = {
+    CONFIG_DESC(pio_hid_report_desc_bridge, 0x01, 0x01, 8)
+};
+
+static const uint8_t pio_config_desc_radio[] = {
+    CONFIG_DESC(pio_hid_report_desc_radio, 0x00, 0x00, 64)
+};
+
+static const uint8_t pio_config_desc_teleop[] = {
+    CONFIG_DESC(pio_hid_report_desc_teleop, 0x00, 0x00, 64)
+};
+
+static const uint8_t pio_config_desc_full[] = {
+    CONFIG_DESC(pio_hid_report_desc_full, 0x00, 0x00, 64)
+};
+
+static const uint8_t *pio_hid_reports[] = {
+    pio_hid_report_desc_bridge
 };
 
 static string_descriptor_t pio_string_desc[4];
@@ -155,6 +308,40 @@ static void fill_string_descriptor(string_descriptor_t *dst, const char *ascii) 
 }
 
 void pio_descs_init(void) {
+    const uint8_t *device_desc = pio_device_desc_bridge;
+    const uint8_t *config_desc = pio_config_desc_bridge;
+    const uint8_t *report_desc = pio_hid_report_desc_bridge;
+    const char *product = USB_POINTER_PRODUCT_STRING;
+
+    switch (g_desc_mode) {
+        case HID_MODE_RADIO:
+            device_desc = pio_device_desc_radio;
+            config_desc = pio_config_desc_radio;
+            report_desc = pio_hid_report_desc_radio;
+            product = USB_RADIO_PRODUCT_STRING;
+            break;
+
+        case HID_MODE_TELEOP:
+            device_desc = pio_device_desc_teleop;
+            config_desc = pio_config_desc_teleop;
+            report_desc = pio_hid_report_desc_teleop;
+            product = USB_TELEOP_PRODUCT_STRING;
+            break;
+
+        case HID_MODE_FULL:
+            device_desc = pio_device_desc_full;
+            config_desc = pio_config_desc_full;
+            report_desc = pio_hid_report_desc_full;
+            product = USB_FULL_PRODUCT_STRING;
+            break;
+
+        case HID_MODE_BRIDGE:
+        default:
+            break;
+    }
+
+    pio_hid_reports[0] = report_desc;
+
     memset(pio_string_desc, 0, sizeof(pio_string_desc));
 
     pio_string_desc[0].length = 4;
@@ -163,11 +350,11 @@ void pio_descs_init(void) {
     pio_string_desc[0].string[1] = 0x04;
 
     fill_string_descriptor(&pio_string_desc[1], USB_MANUFACTURER_STRING);
-    fill_string_descriptor(&pio_string_desc[2], USB_POINTER_PRODUCT_STRING);
+    fill_string_descriptor(&pio_string_desc[2], product);
     fill_string_descriptor(&pio_string_desc[3], USB_SHARED_SERIAL_STRING);
 
-    pio_descs.device = pio_device_desc;
-    pio_descs.config = pio_config_desc;
+    pio_descs.device = device_desc;
+    pio_descs.config = config_desc;
     pio_descs.hid_report = pio_hid_reports;
     pio_descs.string = pio_string_desc;
 }

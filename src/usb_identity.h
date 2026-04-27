@@ -17,6 +17,18 @@
 #define USB_INTERFACE_STRING "Command Port"
 #endif
 
+#ifndef USB_RADIO_PRODUCT_STRING
+#define USB_RADIO_PRODUCT_STRING "Virtual FPV Radio"
+#endif
+
+#ifndef USB_TELEOP_PRODUCT_STRING
+#define USB_TELEOP_PRODUCT_STRING "Teleop HID"
+#endif
+
+#ifndef USB_FULL_PRODUCT_STRING
+#define USB_FULL_PRODUCT_STRING "USB Bridge Full Experimental"
+#endif
+
 #ifndef USB_SHARED_SERIAL_STRING
 #define USB_SHARED_SERIAL_STRING "BRIDGE0001"
 #endif

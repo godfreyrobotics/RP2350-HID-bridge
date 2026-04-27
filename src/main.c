@@ -6,23 +6,38 @@
 #include <math.h>
 
 #include "pico/stdlib.h"
+#include "hardware/watchdog.h"
+#include "hardware/structs/watchdog.h"
 #include "tusb.h"
 
 #include "pio_usb.h"
 #include "pio_usb_configuration.h"
 #include "usb_definitions.h"
+#include "hid_modes.h"
 
 extern usb_descriptor_buffers_t pio_descs;
 void pio_descs_init(void);
+void pio_descs_set_mode(hid_mode_t mode);
 bool pio_usb_device_transfer(uint8_t ep_address, uint8_t *buffer, uint16_t buflen);
 
-#define CDC_LINE_BUF_SIZE 192
+#define CDC_LINE_BUF_SIZE 384
 #define HEARTBEAT_TIMEOUT_MS 2000
 #define ACTION_QUEUE_SIZE 512
+
+#define RADIO_AXIS_COUNT 8
+#define TELEOP_AXES_PER_BANK 30
+#define TELEOP_BANK_COUNT 2
+#define TELEOP_AXIS_COUNT (TELEOP_AXES_PER_BANK * TELEOP_BANK_COUNT)
+
+#define MODE_SCRATCH_MAGIC_INDEX 0
+#define MODE_SCRATCH_VALUE_INDEX 1
+#define MODE_SCRATCH_MAGIC 0x4849444Du
 
 enum {
     REPORT_ID_MOUSE = 0x01,
     REPORT_ID_KEYBOARD = 0x02,
+    REPORT_ID_RADIO = 0x03,
+    REPORT_ID_TELEOP_BANK = 0x04,
 };
 
 typedef struct {
@@ -39,6 +54,20 @@ typedef struct {
     uint8_t keycodes[6];
     bool dirty;
 } keyboard_state_t;
+
+typedef struct {
+    int16_t axes[RADIO_AXIS_COUNT];
+    uint16_t buttons;
+    bool dirty;
+} radio_state_t;
+
+typedef struct {
+    int16_t axes[TELEOP_AXIS_COUNT];
+    bool bank_dirty[TELEOP_BANK_COUNT];
+    uint8_t sequence;
+    uint8_t bank_sequence[TELEOP_BANK_COUNT];
+    uint8_t next_bank_to_try;
+} teleop_state_t;
 
 typedef enum {
     ACT_NONE = 0,
@@ -65,6 +94,9 @@ typedef struct {
 
 static mouse_state_t g_mouse = {0};
 static keyboard_state_t g_kbd = {0};
+static radio_state_t g_radio = {0};
+static teleop_state_t g_teleop = {0};
+static hid_mode_t g_hid_mode = HID_MODE_BRIDGE;
 static char g_line_buf[CDC_LINE_BUF_SIZE];
 static size_t g_line_len = 0;
 static absolute_time_t g_last_heartbeat;
@@ -84,6 +116,46 @@ static inline int8_t clamp_i8(int v) {
     if (v < -127) return -127;
     if (v > 127) return 127;
     return (int8_t)v;
+}
+
+static inline int clamp_cdc_axis(int v) {
+    if (v < -1000) return -1000;
+    if (v > 1000) return 1000;
+    return v;
+}
+
+static inline int16_t cdc_axis_to_hid_i16(int v) {
+    v = clamp_cdc_axis(v);
+    return (int16_t)((v * 32767) / 1000);
+}
+
+static bool mode_supports_bridge(void) {
+    return g_hid_mode == HID_MODE_BRIDGE || g_hid_mode == HID_MODE_FULL;
+}
+
+static bool mode_supports_radio(void) {
+    return g_hid_mode == HID_MODE_RADIO || g_hid_mode == HID_MODE_FULL;
+}
+
+static bool mode_supports_teleop(void) {
+    return g_hid_mode == HID_MODE_TELEOP || g_hid_mode == HID_MODE_FULL;
+}
+
+static hid_mode_t read_requested_mode(void) {
+    if (watchdog_hw->scratch[MODE_SCRATCH_MAGIC_INDEX] == MODE_SCRATCH_MAGIC) {
+        return hid_mode_from_u32(watchdog_hw->scratch[MODE_SCRATCH_VALUE_INDEX]);
+    }
+    return HID_MODE_BRIDGE;
+}
+
+static void mode_store_and_reboot(hid_mode_t mode) {
+    watchdog_hw->scratch[MODE_SCRATCH_MAGIC_INDEX] = MODE_SCRATCH_MAGIC;
+    watchdog_hw->scratch[MODE_SCRATCH_VALUE_INDEX] = (uint32_t)mode;
+    sleep_ms(50);
+    watchdog_reboot(0, 0, 10);
+    while (true) {
+        tight_loop_contents();
+    }
 }
 
 static inline uint32_t now_ms(void) {
@@ -199,6 +271,52 @@ static void keyboard_release_all(void) {
     keyboard_mark_dirty();
 }
 
+
+
+static void radio_mark_dirty(void) {
+    g_radio.dirty = true;
+}
+
+static void radio_reset(void) {
+    memset(g_radio.axes, 0, sizeof(g_radio.axes));
+    g_radio.axes[2] = cdc_axis_to_hid_i16(-1000);
+    g_radio.buttons = 0;
+    radio_mark_dirty();
+}
+
+static bool radio_button_valid(int n) {
+    return n >= 1 && n <= 16;
+}
+
+static uint16_t radio_button_mask(int n) {
+    return (uint16_t)(1u << (n - 1));
+}
+
+static void teleop_bump_sequence(void) {
+    g_teleop.sequence++;
+    if (g_teleop.sequence == 0) {
+        g_teleop.sequence = 1;
+    }
+}
+
+static void teleop_mark_bank_dirty(int bank) {
+    if (bank < 0 || bank >= TELEOP_BANK_COUNT) return;
+    g_teleop.bank_dirty[bank] = true;
+    g_teleop.bank_sequence[bank] = g_teleop.sequence;
+}
+
+static void teleop_mark_all_dirty(void) {
+    for (int bank = 0; bank < TELEOP_BANK_COUNT; ++bank) {
+        teleop_mark_bank_dirty(bank);
+    }
+}
+
+static void teleop_reset(void) {
+    memset(g_teleop.axes, 0, sizeof(g_teleop.axes));
+    teleop_bump_sequence();
+    teleop_mark_all_dirty();
+}
+
 static bool keyboard_has_key(uint8_t keycode) {
     for (size_t idx = 0; idx < sizeof(g_kbd.keycodes); ++idx) {
         if (g_kbd.keycodes[idx] == keycode) return true;
@@ -241,20 +359,25 @@ static void keyboard_set_modifiers(uint8_t modifiers) {
 static void hid_release_all(void) {
     mouse_release_all();
     keyboard_release_all();
+    radio_reset();
+    teleop_reset();
 }
 
 static void send_status(void) {
-    char msg[224];
+    char msg[256];
     snprintf(
         msg, sizeof(msg),
-        "STATUS buttons=%u x=%d y=%d wheel=%d pan=%d kmod=0x%02X keys=%02X,%02X,%02X,%02X,%02X,%02X q=%u",
+        "STATUS mode=%s buttons=%u x=%d y=%d wheel=%d pan=%d kmod=0x%02X keys=%02X,%02X,%02X,%02X,%02X,%02X q=%u radio_btn=0x%04X teleop_seq=%u",
+        hid_mode_name(g_hid_mode),
         g_mouse.buttons,
         g_mouse.x, g_mouse.y,
         g_mouse.wheel, g_mouse.pan,
         g_kbd.modifiers,
         g_kbd.keycodes[0], g_kbd.keycodes[1], g_kbd.keycodes[2],
         g_kbd.keycodes[3], g_kbd.keycodes[4], g_kbd.keycodes[5],
-        (unsigned)((g_q_tail + ACTION_QUEUE_SIZE - g_q_head) % ACTION_QUEUE_SIZE)
+        (unsigned)((g_q_tail + ACTION_QUEUE_SIZE - g_q_head) % ACTION_QUEUE_SIZE),
+        g_radio.buttons,
+        g_teleop.sequence
     );
     cdc_write_line(msg);
 }
@@ -496,6 +619,62 @@ static bool enqueue_smooth_path(uint8_t held_buttons,
     return ok;
 }
 
+
+
+static int parse_int_tokens(char *line, int *values, int max_values) {
+    int count = 0;
+    char *tok = strtok(line, " \t");
+    while (tok != NULL) {
+        if (count >= max_values) {
+            return -1;
+        }
+
+        char *end = NULL;
+        long v = strtol(tok, &end, 0);
+        if (end == tok || *end != '\0') {
+            return -1;
+        }
+        values[count++] = (int)v;
+        tok = strtok(NULL, " \t");
+    }
+    return count;
+}
+
+static bool parse_prefixed_ints(const char *line, const char *prefix, int *values, int max_values, int *count_out) {
+    size_t n = strlen(prefix);
+    if (strncmp(line, prefix, n) != 0) return false;
+    if (line[n] != '\0' && line[n] != ' ' && line[n] != '\t') return false;
+
+    char tmp[CDC_LINE_BUF_SIZE];
+    strncpy(tmp, line + n, sizeof(tmp) - 1);
+    tmp[sizeof(tmp) - 1] = '\0';
+
+    int count = parse_int_tokens(tmp, values, max_values);
+    if (count < 0) return false;
+    *count_out = count;
+    return true;
+}
+
+static bool parse_mode_name(const char *s, hid_mode_t *mode_out) {
+    if (strcmp(s, "BRIDGE") == 0 || strcmp(s, "MK") == 0 || strcmp(s, "MOUSE") == 0) {
+        *mode_out = HID_MODE_BRIDGE;
+        return true;
+    }
+    if (strcmp(s, "RADIO") == 0 || strcmp(s, "FPV") == 0 || strcmp(s, "JOYSTICK") == 0) {
+        *mode_out = HID_MODE_RADIO;
+        return true;
+    }
+    if (strcmp(s, "TELEOP") == 0) {
+        *mode_out = HID_MODE_TELEOP;
+        return true;
+    }
+    if (strcmp(s, "FULL") == 0 || strcmp(s, "EXPERIMENTAL") == 0) {
+        *mode_out = HID_MODE_FULL;
+        return true;
+    }
+    return false;
+}
+
 static void service_cdc_rx(void) {
     while (tud_cdc_available()) {
         uint8_t ch;
@@ -521,6 +700,30 @@ static void service_cdc_rx(void) {
                 continue;
             }
 
+            if (strcmp(line, "MODE") == 0) {
+                char msg[96];
+                snprintf(msg, sizeof(msg), "MODE %s", hid_mode_name(g_hid_mode));
+                cdc_write_line(msg);
+                continue;
+            }
+
+            char mode_arg[24];
+            if (sscanf(line, "MODE %23s", mode_arg) == 1) {
+                hid_mode_t requested;
+                if (!parse_mode_name(mode_arg, &requested)) {
+                    cdc_write_line("ERR MODE");
+                    continue;
+                }
+                if (requested == g_hid_mode) {
+                    cdc_write_line("OK MODE UNCHANGED");
+                    continue;
+                }
+                char msg[96];
+                snprintf(msg, sizeof(msg), "OK MODE %s REBOOTING", hid_mode_name(requested));
+                cdc_write_line(msg);
+                mode_store_and_reboot(requested);
+            }
+
             if (strcmp(line, "HEARTBEAT") == 0) {
                 g_last_heartbeat = get_absolute_time();
                 g_watchdog_tripped = false;
@@ -535,14 +738,142 @@ static void service_cdc_rx(void) {
             }
 
             if (strcmp(line, "CANCEL_MOTION") == 0) {
+                if (!mode_supports_bridge()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
                 preempt_motion_plan(true);
                 cdc_write_line("OK CANCEL_MOTION");
+                continue;
+            }
+
+            if (strcmp(line, "RADIO_RESET") == 0) {
+                if (!mode_supports_radio()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                radio_reset();
+                cdc_write_line("OK RADIO_RESET");
+                continue;
+            }
+
+            if (strcmp(line, "TELEOP_RESET") == 0) {
+                if (!mode_supports_teleop()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                teleop_reset();
+                cdc_write_line("OK TELEOP_RESET");
+                continue;
+            }
+
+            int values[TELEOP_AXES_PER_BANK + 2];
+            int value_count = 0;
+
+            if (parse_prefixed_ints(line, "RADIO", values, RADIO_AXIS_COUNT, &value_count)) {
+                if (!mode_supports_radio()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                if (value_count < 4 || value_count > RADIO_AXIS_COUNT) {
+                    cdc_write_line("ERR RADIO_ARGS");
+                    continue;
+                }
+                for (int n = 0; n < RADIO_AXIS_COUNT; ++n) {
+                    g_radio.axes[n] = (n < value_count) ? cdc_axis_to_hid_i16(values[n]) : 0;
+                }
+                radio_mark_dirty();
+                cdc_write_line("OK RADIO");
+                continue;
+            }
+
+            if (parse_prefixed_ints(line, "RADIO_BUTTONS", values, 1, &value_count)) {
+                if (!mode_supports_radio()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                if (value_count != 1 || values[0] < 0 || values[0] > 0xFFFF) {
+                    cdc_write_line("ERR RADIO_BUTTONS");
+                    continue;
+                }
+                g_radio.buttons = (uint16_t)values[0];
+                radio_mark_dirty();
+                cdc_write_line("OK RADIO_BUTTONS");
+                continue;
+            }
+
+            if (parse_prefixed_ints(line, "RADIO_PRESS", values, 1, &value_count)) {
+                if (!mode_supports_radio()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                if (value_count != 1 || !radio_button_valid(values[0])) {
+                    cdc_write_line("ERR RADIO_BUTTON");
+                    continue;
+                }
+                g_radio.buttons |= radio_button_mask(values[0]);
+                radio_mark_dirty();
+                cdc_write_line("OK RADIO_PRESS");
+                continue;
+            }
+
+            if (parse_prefixed_ints(line, "RADIO_RELEASE", values, 1, &value_count)) {
+                if (!mode_supports_radio()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                if (value_count != 1 || !radio_button_valid(values[0])) {
+                    cdc_write_line("ERR RADIO_BUTTON");
+                    continue;
+                }
+                g_radio.buttons &= (uint16_t)~radio_button_mask(values[0]);
+                radio_mark_dirty();
+                cdc_write_line("OK RADIO_RELEASE");
+                continue;
+            }
+
+            if (parse_prefixed_ints(line, "TELEOP_AXIS", values, 2, &value_count)) {
+                if (!mode_supports_teleop()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                if (value_count != 2 || values[0] < 0 || values[0] >= TELEOP_AXIS_COUNT) {
+                    cdc_write_line("ERR TELEOP_AXIS");
+                    continue;
+                }
+                int axis = values[0];
+                g_teleop.axes[axis] = cdc_axis_to_hid_i16(values[1]);
+                teleop_bump_sequence();
+                teleop_mark_bank_dirty(axis / TELEOP_AXES_PER_BANK);
+                cdc_write_line("OK TELEOP_AXIS");
+                continue;
+            }
+
+            if (parse_prefixed_ints(line, "TELEOP_BANK", values, TELEOP_AXES_PER_BANK + 1, &value_count)) {
+                if (!mode_supports_teleop()) {
+                    cdc_write_line("ERR MODE_UNSUPPORTED");
+                    continue;
+                }
+                if (value_count != TELEOP_AXES_PER_BANK + 1 ||
+                    values[0] < 0 || values[0] >= TELEOP_BANK_COUNT) {
+                    cdc_write_line("ERR TELEOP_BANK");
+                    continue;
+                }
+                int bank = values[0];
+                int base = bank * TELEOP_AXES_PER_BANK;
+                for (int n = 0; n < TELEOP_AXES_PER_BANK; ++n) {
+                    g_teleop.axes[base + n] = cdc_axis_to_hid_i16(values[n + 1]);
+                }
+                teleop_bump_sequence();
+                teleop_mark_bank_dirty(bank);
+                cdc_write_line("OK TELEOP_BANK");
                 continue;
             }
 
             int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0;
 
             if (sscanf(line, "MOVE %d %d", &a, &b) == 2) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 preempt_motion_plan(true);
                 mouse_mark_report(g_mouse.buttons, a, b, 0, 0);
                 cdc_write_line("OK MOVE");
@@ -550,12 +881,14 @@ static void service_cdc_rx(void) {
             }
 
             if (sscanf(line, "SCROLL %d %d", &a, &b) == 2) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 mouse_mark_report(g_mouse.buttons, 0, 0, a, b);
                 cdc_write_line("OK SCROLL");
                 continue;
             }
 
             if (sscanf(line, "BUTTONS %d", &a) == 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 g_motion_owns_button = false;
                 g_motion_owned_mask = 0;
                 mouse_mark_button_state((uint8_t)(a & 0x1F));
@@ -564,6 +897,7 @@ static void service_cdc_rx(void) {
             }
 
             if (sscanf(line, "PRESS %d", &a) == 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (!button_valid(a)) {
                     cdc_write_line("ERR BUTTON");
                     continue;
@@ -576,6 +910,7 @@ static void service_cdc_rx(void) {
             }
 
             if (sscanf(line, "RELEASE %d", &a) == 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (!button_valid(a)) {
                     cdc_write_line("ERR BUTTON");
                     continue;
@@ -591,6 +926,7 @@ static void service_cdc_rx(void) {
 
             int parsed_click = sscanf(line, "CLICK %d %d %d %d %d %d", &a, &b, &c, &d, &e, &f);
             if (parsed_click >= 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 int button = a;
                 int count = (parsed_click >= 2) ? b : 1;
                 int interval_ms = (parsed_click >= 3) ? c : 120;
@@ -634,6 +970,7 @@ static void service_cdc_rx(void) {
                                        "MOVE_SMOOTH %d %d %d %d %d %d %d %d %d",
                                        &a, &b, &c, &d, &e, &f, &g, &h, &i);
             if (parsed_smooth >= 4) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 int dx = a;
                 int dy = b;
                 int duration_ms = c;
@@ -657,6 +994,7 @@ static void service_cdc_rx(void) {
                                      &btn, &dx, &dy, &duration_ms, &steps,
                                      &curve, &overshoot, &jitter, &timing_jitter, &final_correct_i);
             if (parsed_drag >= 5) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (!button_valid(btn)) {
                     cdc_write_line("ERR BUTTON");
                     continue;
@@ -694,6 +1032,7 @@ static void service_cdc_rx(void) {
             int k0, k1, k2, k3, k4, k5, k6;
 
             if (sscanf(line, "KEY_PRESS %d", &a) == 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (a < 0 || a > 0x65) {
                     cdc_write_line("ERR KEYCODE");
                     continue;
@@ -703,6 +1042,7 @@ static void service_cdc_rx(void) {
             }
 
             if (sscanf(line, "KEY_RELEASE %d", &a) == 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (a < 0 || a > 0x65) {
                     cdc_write_line("ERR KEYCODE");
                     continue;
@@ -713,6 +1053,7 @@ static void service_cdc_rx(void) {
             }
 
             if (sscanf(line, "MOD_PRESS %d", &a) == 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (a < 0 || a > 0xFF) {
                     cdc_write_line("ERR MODMASK");
                     continue;
@@ -723,6 +1064,7 @@ static void service_cdc_rx(void) {
             }
 
             if (sscanf(line, "MOD_RELEASE %d", &a) == 1) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (a < 0 || a > 0xFF) {
                     cdc_write_line("ERR MODMASK");
                     continue;
@@ -733,12 +1075,14 @@ static void service_cdc_rx(void) {
             }
 
             if (strcmp(line, "KEY_RESET") == 0) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 keyboard_release_all();
                 cdc_write_line("OK KEY_RESET");
                 continue;
             }
 
             if (sscanf(line, "KEYBOARD %d %d %d %d %d %d %d", &k0, &k1, &k2, &k3, &k4, &k5, &k6) == 7) {
+                if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 if (k0 < 0 || k0 > 0xFF ||
                     k1 < 0 || k1 > 0x65 ||
                     k2 < 0 || k2 > 0x65 ||
@@ -868,10 +1212,117 @@ static void service_pio_keyboard_tx(void) {
     }
 }
 
+
+
+static void service_pio_radio_tx(void) {
+    if (!g_radio.dirty) return;
+
+    if (g_hid_mode == HID_MODE_RADIO) {
+        uint8_t report[RADIO_AXIS_COUNT * 2 + 2];
+        for (int n = 0; n < RADIO_AXIS_COUNT; ++n) {
+            uint16_t v = (uint16_t)g_radio.axes[n];
+            report[n * 2] = (uint8_t)(v & 0xFF);
+            report[n * 2 + 1] = (uint8_t)(v >> 8);
+        }
+        report[RADIO_AXIS_COUNT * 2] = (uint8_t)(g_radio.buttons & 0xFF);
+        report[RADIO_AXIS_COUNT * 2 + 1] = (uint8_t)(g_radio.buttons >> 8);
+
+        if (pio_usb_device_transfer(0x81, report, sizeof(report))) {
+            g_radio.dirty = false;
+        }
+        return;
+    }
+
+    if (g_hid_mode == HID_MODE_FULL) {
+        if (g_mouse.dirty || g_kbd.dirty) return;
+
+        uint8_t report[1 + RADIO_AXIS_COUNT * 2 + 2];
+        report[0] = REPORT_ID_RADIO;
+        for (int n = 0; n < RADIO_AXIS_COUNT; ++n) {
+            uint16_t v = (uint16_t)g_radio.axes[n];
+            report[1 + n * 2] = (uint8_t)(v & 0xFF);
+            report[2 + n * 2] = (uint8_t)(v >> 8);
+        }
+        report[1 + RADIO_AXIS_COUNT * 2] = (uint8_t)(g_radio.buttons & 0xFF);
+        report[2 + RADIO_AXIS_COUNT * 2] = (uint8_t)(g_radio.buttons >> 8);
+
+        if (pio_usb_device_transfer(0x81, report, sizeof(report))) {
+            g_radio.dirty = false;
+        }
+    }
+}
+
+static void service_pio_teleop_tx(void) {
+    if (!(g_hid_mode == HID_MODE_TELEOP || g_hid_mode == HID_MODE_FULL)) return;
+    if (g_hid_mode == HID_MODE_FULL && (g_mouse.dirty || g_kbd.dirty || g_radio.dirty)) return;
+
+    for (int attempt = 0; attempt < TELEOP_BANK_COUNT; ++attempt) {
+        int bank = (g_teleop.next_bank_to_try + attempt) % TELEOP_BANK_COUNT;
+        if (!g_teleop.bank_dirty[bank]) continue;
+
+        uint8_t report_seq = g_teleop.bank_sequence[bank];
+        int base = bank * TELEOP_AXES_PER_BANK;
+
+        if (g_hid_mode == HID_MODE_TELEOP) {
+            uint8_t report[1 + 1 + TELEOP_AXES_PER_BANK * 2];
+            report[0] = (uint8_t)bank;
+            report[1] = report_seq;
+            for (int n = 0; n < TELEOP_AXES_PER_BANK; ++n) {
+                uint16_t v = (uint16_t)g_teleop.axes[base + n];
+                report[2 + n * 2] = (uint8_t)(v & 0xFF);
+                report[3 + n * 2] = (uint8_t)(v >> 8);
+            }
+
+            if (pio_usb_device_transfer(0x81, report, sizeof(report))) {
+                if (g_teleop.bank_sequence[bank] == report_seq) {
+                    g_teleop.bank_dirty[bank] = false;
+                }
+                g_teleop.next_bank_to_try = (uint8_t)((bank + 1) % TELEOP_BANK_COUNT);
+            }
+            return;
+        }
+
+        if (g_hid_mode == HID_MODE_FULL) {
+            uint8_t report[1 + 1 + 1 + TELEOP_AXES_PER_BANK * 2];
+            report[0] = REPORT_ID_TELEOP_BANK;
+            report[1] = (uint8_t)bank;
+            report[2] = report_seq;
+            for (int n = 0; n < TELEOP_AXES_PER_BANK; ++n) {
+                uint16_t v = (uint16_t)g_teleop.axes[base + n];
+                report[3 + n * 2] = (uint8_t)(v & 0xFF);
+                report[4 + n * 2] = (uint8_t)(v >> 8);
+            }
+
+            if (pio_usb_device_transfer(0x81, report, sizeof(report))) {
+                if (g_teleop.bank_sequence[bank] == report_seq) {
+                    g_teleop.bank_dirty[bank] = false;
+                }
+                g_teleop.next_bank_to_try = (uint8_t)((bank + 1) % TELEOP_BANK_COUNT);
+            }
+            return;
+        }
+    }
+}
+
+static void service_pio_hid_tx(void) {
+    if (mode_supports_bridge()) {
+        service_pio_mouse_tx();
+        service_pio_keyboard_tx();
+    }
+    if (mode_supports_radio()) {
+        service_pio_radio_tx();
+    }
+    if (mode_supports_teleop()) {
+        service_pio_teleop_tx();
+    }
+}
+
 int main(void) {
     stdio_init_all();
     tusb_init();
 
+    g_hid_mode = read_requested_mode();
+    pio_descs_set_mode(g_hid_mode);
     pio_descs_init();
 
     const pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
@@ -881,6 +1332,8 @@ int main(void) {
     g_last_status = get_absolute_time();
 
     srand((unsigned)time_us_32());
+    radio_reset();
+    teleop_reset();
 
     while (true) {
         tud_task();
@@ -892,8 +1345,7 @@ int main(void) {
 
         service_watchdog();
         service_action_queue();
-        service_pio_mouse_tx();
-        service_pio_keyboard_tx();
+        service_pio_hid_tx();
 
         if (tud_cdc_connected() &&
             absolute_time_diff_us(g_last_status, get_absolute_time()) <= -1000000) {
