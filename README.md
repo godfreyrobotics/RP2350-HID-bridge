@@ -1,15 +1,17 @@
 # RP2350 HID Bridge
 
-Firmware for an RP2350-based computer-to-computer HID bridge that receives CDC commands on the native USB port and emulates USB mouse/keyboard input on the PIO USB port.
+Firmware for an RP2350-based computer-to-computer HID bridge that receives CDC commands on the native USB port and emulates USB HID output on the PIO USB port.
 
 ## Overview
 
 This project targets the **Waveshare RP2350-PiZero** and uses its dual-USB setup to bridge two computers:
 
 - **Native USB port:** CDC command/control input
-- **PIO USB port:** HID mouse/keyboard output
+- **PIO USB port:** HID output to the target computer
 
 A controller computer sends commands to the RP2350 over CDC, and the RP2350 appears to the target computer as a real USB input device.
+
+The firmware supports multiple HID output modes, including a normal mouse/keyboard bridge mode, an FPV radio/joystick mode, a teleoperation mode, and an experimental all-in-one mode.
 
 ## Hardware setup
 
@@ -18,17 +20,23 @@ Typical connection model:
 - **Controller computer** -> connected to the **native USB** port
 - **Target computer** -> connected to the **PIO USB** port
 
-The controller computer sends text-based commands over CDC, and the target computer sees the RP2350 as a USB mouse/keyboard.
+The controller computer sends text-based commands over CDC, and the target computer sees the RP2350 as a USB HID device.
 
 For development and testing, the HID output can also be plugged back into the **same laptop** that is sending the CDC commands.
 
 ## Features
 
+### HID output modes
+
+- RAM-selected HID output modes
+- Mode switching over CDC
+- Mode switching reboots the device so the PIO USB side can re-enumerate with a new HID descriptor
+- No flash writes are used for normal mode switching
+
 ### Mouse
 
 - Relative mouse movement
 - Preemptive motion commands: new motion commands interrupt older active motion plans
-- Preemptive motion commands
 - Button press / release
 - Click and double click
 - Drag operations
@@ -43,6 +51,22 @@ For development and testing, the HID output can also be plugged back into the **
 - Full keyboard state set
 - Keyboard reset
 - Standard 6-key boot keyboard behavior
+
+### FPV radio / joystick
+
+- Simple radio/joystick HID mode
+- 8 analog channels
+- 16 buttons
+- Useful for FPV simulators and games that expect a standard controller
+
+### Teleoperation
+
+- Vendor-defined teleop HID mode
+- 60 analog axes
+- 2 banks
+- 30 axes per bank
+- Sequence byte per bank update
+- Intended for custom robotics/teleoperation software
 
 ### Reliability / control
 
@@ -114,17 +138,125 @@ Once the copy finishes, the board should automatically reboot into the new firmw
 
 ## USB architecture
 
-This project uses the board’s two USB paths for separate roles:
+This project uses the board's two USB paths for separate roles:
 
 - **Native USB**
   - Enumerates as a CDC serial/control interface
   - Receives text commands from the controller computer
 
 - **PIO USB**
-  - Enumerates as a HID device
-  - Currently exposes mouse and keyboard functionality to the target computer
+  - Enumerates as the selected HID output mode
+  - Sends mouse, keyboard, joystick/radio, or teleop HID reports to the target computer depending on the active mode
 
 This keeps the control channel separate from the HID output side.
+
+## HID output modes
+
+The firmware supports multiple PIO USB HID output modes. The selected mode is stored in RAM/watchdog scratch state, not flash, so switching modes does not consume flash write cycles.
+
+Changing modes causes the RP2350 to reboot so that the PIO USB side can re-enumerate with a different USB HID descriptor. This is necessary because USB descriptors are read by the target computer when the device connects.
+
+### Available modes
+
+#### `BRIDGE`
+
+Default mouse/keyboard bridge mode.
+
+PIO USB exposes:
+
+- USB mouse
+- USB keyboard
+
+Use this mode for normal computer-to-computer HID automation.
+
+#### `RADIO`
+
+FPV simulator / joystick mode.
+
+PIO USB exposes:
+
+- USB joystick / FPV radio controller
+- 8 analog channels
+- 16 buttons
+
+Use this mode for FPV simulators or games that expect a standard controller.
+
+#### `TELEOP`
+
+Teleoperation mode.
+
+PIO USB exposes:
+
+- Vendor-defined teleoperation HID device
+- 60 analog axes
+- 2 banks
+- 30 axes per bank
+- sequence byte per bank update
+
+This mode is intended for custom robotics/teleoperation software that reads HID reports directly.
+
+#### `FULL`
+
+Experimental all-in-one mode.
+
+PIO USB exposes:
+
+- mouse
+- keyboard
+- radio controller
+- teleop report
+
+This mode is useful for Linux/custom testing, but may not be compatible with Windows games or simulators.
+
+### Mode commands
+
+#### `MODE`
+
+Prints the current HID output mode.
+
+```text
+MODE
+```
+
+#### `MODE BRIDGE`
+
+Switches to normal mouse/keyboard bridge mode and reboots.
+
+```text
+MODE BRIDGE
+```
+
+#### `MODE RADIO`
+
+Switches to FPV radio/joystick mode and reboots.
+
+```text
+MODE RADIO
+```
+
+#### `MODE TELEOP`
+
+Switches to teleoperation HID mode and reboots.
+
+```text
+MODE TELEOP
+```
+
+#### `MODE FULL`
+
+Switches to the experimental combined HID mode and reboots.
+
+```text
+MODE FULL
+```
+
+Example:
+
+```bash
+printf 'MODE RADIO\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+After switching modes, the CDC serial port may disconnect and reconnect.
 
 ## CDC command protocol
 
@@ -143,6 +275,8 @@ MOVE 100 0
 CLICK 1
 KEY_PRESS 4
 MOD_PRESS 1
+MODE RADIO
+RADIO 0 0 -1000 0 0 0 0 0
 ```
 
 ### General commands
@@ -173,13 +307,15 @@ HEARTBEAT
 
 #### `RESET`
 
-Releases all mouse buttons, clears keyboard state, and cancels active scheduled input activity.
+Releases all input state and cancels active scheduled input activity.
 
 ```text
 RESET
 ```
 
 ## Mouse commands
+
+Mouse commands are available in `BRIDGE` mode and `FULL` mode.
 
 ### `MOVE dx dy`
 
@@ -233,12 +369,13 @@ Example:
 DRAG 1 250 0 1000 40
 ```
 
-#### `CANCEL_MOTION`
+### `CANCEL_MOTION`
 
 Cancels the active motion plan immediately.
 
 ```text
 CANCEL_MOTION
+```
 
 ### `CLICK button [count] [interval_ms] [hold_ms] [interval_jitter_ms] [hold_jitter_ms]`
 
@@ -309,6 +446,8 @@ SCROLL 0 -3
 
 ## Keyboard commands
 
+Keyboard commands are available in `BRIDGE` mode and `FULL` mode.
+
 ### `KEY_PRESS keycode`
 
 Presses a non-modifier key.
@@ -374,6 +513,120 @@ Example:
 KEY_RESET
 ```
 
+## Radio commands
+
+Radio commands are available in `RADIO` mode and `FULL` mode.
+
+Channel order:
+
+```text
+RADIO roll pitch throttle yaw aux1 aux2 aux3 aux4
+```
+
+Values are normalized from `-1000` to `1000`.
+
+### `RADIO ch1 ch2 ch3 ch4 [ch5 ch6 ch7 ch8]`
+
+Sets the current radio channel state.
+
+Example neutral sticks with low throttle:
+
+```text
+RADIO 0 0 -1000 0 0 0 0 0
+```
+
+Example roll right:
+
+```text
+RADIO 1000 0 -1000 0 0 0 0 0
+```
+
+### `RADIO_RESET`
+
+Resets radio channels to a safe state.
+
+```text
+RADIO_RESET
+```
+
+Safe reset state:
+
+- roll = `0`
+- pitch = `0`
+- throttle = `-1000`
+- yaw = `0`
+- aux channels = `0`
+- buttons off
+
+### `RADIO_BUTTONS mask`
+
+Sets the full 16-bit radio button mask.
+
+```text
+RADIO_BUTTONS 0x0001
+```
+
+### `RADIO_PRESS button`
+
+Presses a radio button.
+
+```text
+RADIO_PRESS 1
+```
+
+### `RADIO_RELEASE button`
+
+Releases a radio button.
+
+```text
+RADIO_RELEASE 1
+```
+
+## Teleop commands
+
+Teleop commands are available in `TELEOP` mode and `FULL` mode.
+
+The teleop HID report exposes 60 signed analog axes:
+
+- bank 0: axes 0-29
+- bank 1: axes 30-59
+
+Values are normalized from `-1000` to `1000`.
+
+### `TELEOP_AXIS index value`
+
+Sets one teleop axis.
+
+Example:
+
+```text
+TELEOP_AXIS 0 1000
+```
+
+Example for bank 1:
+
+```text
+TELEOP_AXIS 30 -500
+```
+
+### `TELEOP_BANK bank v0 v1 ... v29`
+
+Sets all 30 axes in a bank.
+
+Example:
+
+```text
+TELEOP_BANK 0 1000 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 -1000
+```
+
+### `TELEOP_RESET`
+
+Resets all teleop axes to zero.
+
+```text
+TELEOP_RESET
+```
+
 ## Modifier bitmask reference
 
 Standard HID boot keyboard modifier bits:
@@ -401,6 +654,24 @@ These examples assume the CDC port is available as `/dev/ttyACM0`.
 
 ```bash
 printf 'STATUS\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+### Check current HID mode
+
+```bash
+printf 'MODE\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+### Switch to radio mode
+
+```bash
+printf 'MODE RADIO\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+### Switch back to bridge mode
+
+```bash
+printf 'MODE BRIDGE\n' | sudo tee /dev/ttyACM0 > /dev/null
 ```
 
 ### Move the mouse right
@@ -458,30 +729,75 @@ printf 'KEY_RELEASE 21\n' | sudo tee /dev/ttyACM0 > /dev/null
 printf 'MOD_RELEASE 8\n' | sudo tee /dev/ttyACM0 > /dev/null
 ```
 
+### FPV radio neutral state
+
+```bash
+printf 'RADIO 0 0 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+### FPV radio stick circle
+
+This moves the roll/pitch stick in a circle while keeping throttle low and yaw centered.
+
+```bash
+while true; do
+  printf 'RADIO 1000 0 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+  printf 'RADIO 707 707 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+  printf 'RADIO 0 1000 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+  printf 'RADIO -707 707 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+  printf 'RADIO -1000 0 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+  printf 'RADIO -707 -707 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+  printf 'RADIO 0 -1000 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+  printf 'RADIO 707 -707 -1000 0 0 0 0 0\n' | sudo tee /dev/ttyACM0 > /dev/null
+  sleep 0.15
+done
+```
+
+### Teleop axis test
+
+```bash
+printf 'TELEOP_AXIS 0 1000\n' | sudo tee /dev/ttyACM0 > /dev/null
+printf 'TELEOP_AXIS 30 -1000\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
 ## Safety behavior
 
 This firmware is designed to fail in a safer way than blindly holding input state forever.
 
 - A controller can periodically send `HEARTBEAT`
 - If heartbeats stop, the watchdog can release active input state
-- `RESET` releases all mouse and keyboard state
+- `RESET` releases all input state
 - `KEY_RESET` releases all keyboard state
+- `RADIO_RESET` resets radio channels to a safe state
+- `TELEOP_RESET` resets teleop axes to zero
 - `CANCEL_MOTION` stops active motion immediately
 - New motion commands are preemptive and replace older active motion plans
 - Mouse button state can also be cleared explicitly with `BUTTONS 0`
 
-This helps prevent stuck keys, stuck modifiers, or stuck mouse buttons if the controller software crashes or disconnects.
+This helps prevent stuck keys, stuck modifiers, stuck mouse buttons, or stale controller state if the controller software crashes or disconnects.
 
 ## Current limitations
 
 - Pointer movement is **relative-only** in firmware
 - Standard 6-key boot keyboard behavior only
-- Higher-level macros and motion planning are intended to live on the controller computer, not in firmware
+- Mode switching requires reboot/re-enumeration
+- `FULL` mode is experimental and may not be compatible with Windows games/simulators
+- Higher-level macros, motion planning, CV, and autonomy are intended to live on the controller computer, not in firmware
 
 ## Future work
 
 - Controller-side macro layer
 - Integration with computer vision / autonomous control loops
+- Improved FPV simulator host tooling
+- Host-side teleop configuration/mapping layer
+- Separate documentation for HID descriptors and report formats
 
 ## Hardware
 
@@ -490,3 +806,4 @@ This helps prevent stuck keys, stuck modifiers, or stuck mouse buttons if the co
 ## Notes
 
 - Placeholder VID/PIDs are currently used for development
+- Mode switching is RAM-based and does not write to flash
