@@ -72,6 +72,7 @@ target_link_libraries(rp2350_hid_bridge
     pico_multicore
     hardware_pio
     hardware_dma
+    hardware_flash
     tinyusb_device
     tinyusb_board
     pico_pio_usb

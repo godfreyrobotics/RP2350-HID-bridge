@@ -34,13 +34,25 @@ endpoint_t pio_usb_ep_pool[PIO_USB_EP_POOL_CNT];
 // Bus functions
 //--------------------------------------------------------------------+
 
+
+static inline bool usb_pins_reversed(const root_port_t *port) {
+  return port->pin_dm < port->pin_dp;
+}
+
+static inline uint usb_pin_base(const root_port_t *port) {
+  return port->pin_dp < port->pin_dm ? port->pin_dp : port->pin_dm;
+}
+
+
 static void __no_inline_not_in_flash_func(send_pre)(const pio_port_t *pp) {
   uint8_t data[] = {USB_SYNC, USB_PID_PRE};
 
   // send PRE token in full-speed
   pio_sm_set_enabled(pp->pio_usb_tx, pp->sm_tx, false);
+  const root_port_t *rport = PIO_USB_ROOT_PORT(0);
+  const pio_program_t *pre_program = usb_pins_reversed(rport) ? &usb_tx_fs_pre_rev_program : &usb_tx_fs_pre_program;
   for (uint i = 0; i < USB_TX_EOP_DISABLER_LEN; ++i) {
-    uint16_t instr = usb_tx_fs_pre_program.instructions[i + USB_TX_EOP_OFFSET];
+    uint16_t instr = pre_program->instructions[i + USB_TX_EOP_OFFSET];
     pp->pio_usb_tx->instr_mem[pp->offset_tx + i + USB_TX_EOP_OFFSET] = instr;
   }
 
@@ -58,8 +70,9 @@ static void __no_inline_not_in_flash_func(send_pre)(const pio_port_t *pp) {
 
   // change bus speed to low-speed
   pio_sm_set_enabled(pp->pio_usb_tx, pp->sm_tx, false);
+  const pio_program_t *fs_program = usb_pins_reversed(rport) ? &usb_tx_fs_rev_program : &usb_tx_fs_program;
   for (uint i = 0; i < USB_TX_EOP_DISABLER_LEN; ++i) {
-    uint16_t instr = usb_tx_fs_program.instructions[i + USB_TX_EOP_OFFSET];
+    uint16_t instr = fs_program->instructions[i + USB_TX_EOP_OFFSET];
     pp->pio_usb_tx->instr_mem[pp->offset_tx + i + USB_TX_EOP_OFFSET] = instr;
   }
   SM_SET_CLKDIV(pp->pio_usb_tx, pp->sm_tx, pp->clk_div_ls_tx);
@@ -215,15 +228,17 @@ static __always_inline void add_pio_host_rx_program(PIO pio,
 
 static void __no_inline_not_in_flash_func(initialize_host_programs)(
     pio_port_t *pp, const pio_usb_configuration_t *c, root_port_t *port) {
-  pp->offset_tx = pio_add_program(pp->pio_usb_tx, &usb_tx_fs_program);
+  bool pin_order_reversed = usb_pins_reversed(port);
+  pp->offset_tx = pio_add_program(pp->pio_usb_tx,
+                                  pin_order_reversed ? &usb_tx_fs_rev_program : &usb_tx_fs_program);
   usb_tx_fs_program_init(pp->pio_usb_tx, pp->sm_tx, pp->offset_tx,
-                         port->pin_dp);
+                         port->pin_dp, port->pin_dm, pin_order_reversed);
 
   add_pio_host_rx_program(pp->pio_usb_rx, &usb_nrzi_decoder_program,
                           &usb_nrzi_decoder_debug_program, &pp->offset_rx,
                           c->debug_pin_rx);
-  usb_rx_fs_program_init(pp->pio_usb_rx, pp->sm_rx, pp->offset_rx, port->pin_dp,
-                         c->debug_pin_rx);
+  usb_rx_fs_program_init(pp->pio_usb_rx, pp->sm_rx, pp->offset_rx,
+                         port->pin_dp, port->pin_dm, c->debug_pin_rx);
   pp->rx_reset_instr = pio_encode_jmp(pp->offset_rx);
   pp->rx_reset_instr2 = pio_encode_set(pio_x, 0);
 
@@ -231,9 +246,9 @@ static void __no_inline_not_in_flash_func(initialize_host_programs)(
                           &usb_edge_detector_debug_program, &pp->offset_eop,
                           c->debug_pin_eop);
   eop_detect_fs_program_init(pp->pio_usb_rx, c->sm_eop, pp->offset_eop,
-                             port->pin_dp, true, c->debug_pin_eop);
+                             port->pin_dp, port->pin_dm, true, c->debug_pin_eop);
 
-  usb_tx_configure_pins(pp->pio_usb_tx, pp->sm_tx, port->pin_dp);
+  usb_tx_configure_pins(pp->pio_usb_tx, pp->sm_tx, usb_pin_base(port));
 
   pio_sm_set_jmp_pin(pp->pio_usb_rx, pp->sm_rx, port->pin_dp);
   pio_sm_set_jmp_pin(pp->pio_usb_rx, pp->sm_eop, port->pin_dm);
@@ -261,7 +276,7 @@ static void apply_config(pio_port_t *pp, const pio_usb_configuration_t *c,
   pp->sm_rx = c->sm_rx;
   pp->sm_eop = c->sm_eop;
   port->pin_dp = c->pin_dp;
-  port->pin_dm = c->pin_dp + 1;
+  port->pin_dm = c->pin_dm;
 
   pp->debug_pin_rx = c->debug_pin_rx;
   pp->debug_pin_eop = c->debug_pin_eop;

@@ -165,12 +165,13 @@ flip:
 % c-sdk {
 #include "hardware/clocks.h"
 
-static inline void usb_rx_fs_program_init(PIO pio, uint sm, uint offset, uint pin_dp, int pin_debug) {
-  pio_sm_set_consecutive_pindirs(pio, sm, pin_dp, 2, false);
+static inline void usb_rx_fs_program_init(PIO pio, uint sm, uint offset, uint pin_dp, uint pin_dm, int pin_debug) {
+  uint32_t pin_mask = (1u << pin_dp) | (1u << pin_dm);
+  pio_sm_set_pindirs_with_mask(pio, sm, 0, pin_mask);
   gpio_pull_down(pin_dp);
-  gpio_pull_down(pin_dp + 1);  // dm
+  gpio_pull_down(pin_dm);
   gpio_set_inover(pin_dp, GPIO_OVERRIDE_INVERT);
-  gpio_set_inover(pin_dp + 1, GPIO_OVERRIDE_INVERT);
+  gpio_set_inover(pin_dm, GPIO_OVERRIDE_INVERT);
 
   pio_sm_config c;
 
@@ -198,7 +199,7 @@ static inline void usb_rx_fs_program_init(PIO pio, uint sm, uint offset, uint pi
 }
 
 static inline void eop_detect_fs_program_init(PIO pio, uint sm, uint offset,
-                                           uint pin_dp, bool is_fs, int pin_debug) {
+                                           uint pin_dp, uint pin_dm, bool is_fs, int pin_debug) {
   pio_sm_config c;
 
   if (pin_debug < 0) {
@@ -212,7 +213,7 @@ static inline void eop_detect_fs_program_init(PIO pio, uint sm, uint offset,
   }
 
   sm_config_set_in_pins(&c, pin_dp);  // for WAIT, IN
-  sm_config_set_jmp_pin(&c, pin_dp + 1);  // for JMP
+  sm_config_set_jmp_pin(&c, pin_dm);  // for JMP
 
   sm_config_set_in_shift(&c, false, false, 8);
 

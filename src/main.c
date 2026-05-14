@@ -8,6 +8,9 @@
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/structs/watchdog.h"
+#include "hardware/flash.h"
+#include "hardware/sync.h"
+#include "hardware/regs/addressmap.h"
 #include "tusb.h"
 
 #include "pio_usb.h"
@@ -32,6 +35,62 @@ bool pio_usb_device_transfer(uint8_t ep_address, uint8_t *buffer, uint16_t bufle
 #define MODE_SCRATCH_MAGIC_INDEX 0
 #define MODE_SCRATCH_VALUE_INDEX 1
 #define MODE_SCRATCH_MAGIC 0x4849444Du
+
+#define BOARD_SCRATCH_MAGIC_INDEX 2
+#define BOARD_SCRATCH_VALUE_INDEX 3
+#define BOARD_SCRATCH_MAGIC 0x424F4152u
+
+#define BOARD_CONFIG_MAGIC 0x42434647u
+#define BOARD_CONFIG_VERSION 1u
+#define BOARD_CONFIG_FLASH_OFFSET ((2u * 1024u * 1024u) - FLASH_SECTOR_SIZE)
+#define BOARD_AUTO_FLASH_THRESHOLD_BYTES (8u * 1024u * 1024u)
+#define BOARD_USBA_PIO_STARTUP_DELAY_MS 500
+
+typedef enum {
+    BOARD_WAVESHARE_RP2350_PIZERO = 0,
+    BOARD_WAVESHARE_RP2350_USB_A = 1,
+} board_type_t;
+
+typedef enum {
+    BOARD_SELECT_SOURCE_AUTO = 0,
+    BOARD_SELECT_SOURCE_MANUAL = 1,
+} board_select_source_t;
+
+typedef struct {
+    uint32_t magic;
+    uint32_t version;
+    uint32_t source;
+    uint32_t board;
+    uint32_t checksum;
+    uint32_t reserved[3];
+} persistent_board_config_t;
+
+typedef struct {
+    const char *command_name;
+    const char *display_name;
+    uint8_t pio_usb_dp_pin;
+    uint8_t pio_usb_dm_pin;
+    uint16_t pio_startup_delay_ms;
+} board_profile_t;
+
+static const board_profile_t BOARD_PROFILES[] = {
+    [BOARD_WAVESHARE_RP2350_PIZERO] = {
+        .command_name = "PIZERO",
+        .display_name = "waveshare_rp2350_pizero",
+        .pio_usb_dp_pin = 28,
+        .pio_usb_dm_pin = 29,
+        .pio_startup_delay_ms = 0,
+    },
+    [BOARD_WAVESHARE_RP2350_USB_A] = {
+        .command_name = "USBA",
+        .display_name = "waveshare_rp2350_usb_a",
+        .pio_usb_dp_pin = 12,
+        .pio_usb_dm_pin = 13,
+        .pio_startup_delay_ms = BOARD_USBA_PIO_STARTUP_DELAY_MS,
+    },
+};
+
+#define BOARD_PROFILE_COUNT (sizeof(BOARD_PROFILES) / sizeof(BOARD_PROFILES[0]))
 
 enum {
     REPORT_ID_MOUSE = 0x01,
@@ -97,6 +156,10 @@ static keyboard_state_t g_kbd = {0};
 static radio_state_t g_radio = {0};
 static teleop_state_t g_teleop = {0};
 static hid_mode_t g_hid_mode = HID_MODE_BRIDGE;
+static board_type_t g_board_type = BOARD_WAVESHARE_RP2350_PIZERO;
+static board_type_t g_auto_detected_board_type = BOARD_WAVESHARE_RP2350_PIZERO;
+static board_select_source_t g_board_select_source = BOARD_SELECT_SOURCE_AUTO;
+static uint32_t g_detected_flash_size_bytes = 0;
 static char g_line_buf[CDC_LINE_BUF_SIZE];
 static size_t g_line_len = 0;
 static absolute_time_t g_last_heartbeat;
@@ -111,6 +174,7 @@ static bool g_motion_owns_button = false;
 static uint8_t g_motion_owned_mask = 0;
 
 static void mouse_mark_button_state(uint8_t buttons);
+static void cdc_write_line(const char *s);
 
 static inline int8_t clamp_i8(int v) {
     if (v < -127) return -127;
@@ -156,6 +220,197 @@ static void mode_store_and_reboot(hid_mode_t mode) {
     while (true) {
         tight_loop_contents();
     }
+}
+
+static bool board_type_is_valid(uint32_t value) {
+    return value < BOARD_PROFILE_COUNT;
+}
+
+static const char *board_select_source_name(board_select_source_t source) {
+    switch (source) {
+        case BOARD_SELECT_SOURCE_AUTO:
+            return "auto";
+        case BOARD_SELECT_SOURCE_MANUAL:
+            return "manual";
+        default:
+            return "unknown";
+    }
+}
+
+static uint32_t board_config_checksum(const persistent_board_config_t *config) {
+    return config->magic ^
+           config->version ^
+           config->source ^
+           config->board ^
+           0xA5A55A5Au;
+}
+
+static bool board_config_is_valid(const persistent_board_config_t *config) {
+    if (config->magic != BOARD_CONFIG_MAGIC) return false;
+    if (config->version != BOARD_CONFIG_VERSION) return false;
+    if (config->checksum != board_config_checksum(config)) return false;
+
+    if (config->source != BOARD_SELECT_SOURCE_AUTO &&
+        config->source != BOARD_SELECT_SOURCE_MANUAL) {
+        return false;
+    }
+
+    if (config->source == BOARD_SELECT_SOURCE_MANUAL &&
+        !board_type_is_valid(config->board)) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool board_read_persistent_config(persistent_board_config_t *config_out) {
+    const persistent_board_config_t *flash_config =
+        (const persistent_board_config_t *)(XIP_BASE + BOARD_CONFIG_FLASH_OFFSET);
+
+    memcpy(config_out, flash_config, sizeof(*config_out));
+    return board_config_is_valid(config_out);
+}
+
+static uint32_t board_detect_flash_size_bytes(void) {
+    uint8_t txbuf[4] = {0x9F, 0, 0, 0};
+    uint8_t rxbuf[4] = {0, 0, 0, 0};
+
+    flash_do_cmd(txbuf, rxbuf, sizeof(txbuf));
+
+    uint8_t capacity_code = rxbuf[3];
+    if (capacity_code < 20 || capacity_code > 30) {
+        return 0;
+    }
+
+    return (uint32_t)(1u << capacity_code);
+}
+
+static board_type_t board_auto_detect_from_flash_size(uint32_t flash_size_bytes) {
+    if (flash_size_bytes >= BOARD_AUTO_FLASH_THRESHOLD_BYTES) {
+        return BOARD_WAVESHARE_RP2350_PIZERO;
+    }
+
+    if (flash_size_bytes > 0) {
+        return BOARD_WAVESHARE_RP2350_USB_A;
+    }
+
+    return BOARD_WAVESHARE_RP2350_PIZERO;
+}
+
+static void board_write_persistent_config(const persistent_board_config_t *config) {
+    uint8_t page[FLASH_PAGE_SIZE];
+    memset(page, 0xFF, sizeof(page));
+
+    if (config != NULL) {
+        memcpy(page, config, sizeof(*config));
+    }
+
+    uint32_t ints = save_and_disable_interrupts();
+    flash_range_erase(BOARD_CONFIG_FLASH_OFFSET, FLASH_SECTOR_SIZE);
+    if (config != NULL) {
+        flash_range_program(BOARD_CONFIG_FLASH_OFFSET, page, sizeof(page));
+    }
+    restore_interrupts(ints);
+}
+
+static void board_save_manual_override(board_type_t board) {
+    persistent_board_config_t config = {
+        .magic = BOARD_CONFIG_MAGIC,
+        .version = BOARD_CONFIG_VERSION,
+        .source = BOARD_SELECT_SOURCE_MANUAL,
+        .board = (uint32_t)board,
+        .checksum = 0,
+        .reserved = {0xFFFFFFFFu, 0xFFFFFFFFu, 0xFFFFFFFFu},
+    };
+    config.checksum = board_config_checksum(&config);
+    board_write_persistent_config(&config);
+}
+
+static void board_clear_persistent_override(void) {
+    board_write_persistent_config(NULL);
+}
+
+static board_type_t read_requested_board(void) {
+    g_detected_flash_size_bytes = board_detect_flash_size_bytes();
+    g_auto_detected_board_type = board_auto_detect_from_flash_size(g_detected_flash_size_bytes);
+
+    persistent_board_config_t config;
+    if (board_read_persistent_config(&config)) {
+        if (config.source == BOARD_SELECT_SOURCE_MANUAL) {
+            g_board_select_source = BOARD_SELECT_SOURCE_MANUAL;
+            return (board_type_t)config.board;
+        }
+    }
+
+    g_board_select_source = BOARD_SELECT_SOURCE_AUTO;
+    return g_auto_detected_board_type;
+}
+
+static const board_profile_t *current_board_profile(void) {
+    return &BOARD_PROFILES[g_board_type];
+}
+
+static bool parse_board_name(const char *s, board_type_t *board_out) {
+    if (strcmp(s, "PIZERO") == 0 ||
+        strcmp(s, "PI_ZERO") == 0 ||
+        strcmp(s, "RP2350_PIZERO") == 0 ||
+        strcmp(s, "WAVESHARE_RP2350_PIZERO") == 0) {
+        *board_out = BOARD_WAVESHARE_RP2350_PIZERO;
+        return true;
+    }
+
+    if (strcmp(s, "USBA") == 0 ||
+        strcmp(s, "USB_A") == 0 ||
+        strcmp(s, "RP2350_USB_A") == 0 ||
+        strcmp(s, "WAVESHARE_RP2350_USB_A") == 0) {
+        *board_out = BOARD_WAVESHARE_RP2350_USB_A;
+        return true;
+    }
+
+    return false;
+}
+
+static bool parse_board_auto_name(const char *s) {
+    return strcmp(s, "AUTO") == 0 ||
+           strcmp(s, "AUTODETECT") == 0 ||
+           strcmp(s, "AUTO_DETECT") == 0;
+}
+
+static void board_reboot(void) {
+    sleep_ms(50);
+    watchdog_reboot(0, 0, 10);
+    while (true) {
+        tight_loop_contents();
+    }
+}
+
+static void board_store_and_reboot(board_type_t board) {
+    board_save_manual_override(board);
+    board_reboot();
+}
+
+static void board_clear_and_reboot(void) {
+    board_clear_persistent_override();
+    board_reboot();
+}
+
+static void send_board_status(void) {
+    const board_profile_t *profile = current_board_profile();
+    const board_profile_t *auto_profile = &BOARD_PROFILES[g_auto_detected_board_type];
+
+    char msg[192];
+    snprintf(
+        msg,
+        sizeof(msg),
+        "BOARD %s dp=%u dm=%u source=%s auto=%s flash=%lu",
+        profile->display_name,
+        profile->pio_usb_dp_pin,
+        profile->pio_usb_dm_pin,
+        board_select_source_name(g_board_select_source),
+        auto_profile->display_name,
+        (unsigned long)g_detected_flash_size_bytes
+    );
+    cdc_write_line(msg);
 }
 
 static inline uint32_t now_ms(void) {
@@ -367,8 +622,11 @@ static void send_status(void) {
     char msg[256];
     snprintf(
         msg, sizeof(msg),
-        "STATUS mode=%s buttons=%u x=%d y=%d wheel=%d pan=%d kmod=0x%02X keys=%02X,%02X,%02X,%02X,%02X,%02X q=%u radio_btn=0x%04X teleop_seq=%u",
+        "STATUS mode=%s board=%s dp=%u dm=%u buttons=%u x=%d y=%d wheel=%d pan=%d kmod=0x%02X keys=%02X,%02X,%02X,%02X,%02X,%02X q=%u radio_btn=0x%04X teleop_seq=%u",
         hid_mode_name(g_hid_mode),
+        current_board_profile()->display_name,
+        current_board_profile()->pio_usb_dp_pin,
+        current_board_profile()->pio_usb_dm_pin,
         g_mouse.buttons,
         g_mouse.x, g_mouse.y,
         g_mouse.wheel, g_mouse.pan,
@@ -722,6 +980,74 @@ static void service_cdc_rx(void) {
                 snprintf(msg, sizeof(msg), "OK MODE %s REBOOTING", hid_mode_name(requested));
                 cdc_write_line(msg);
                 mode_store_and_reboot(requested);
+            }
+
+            if (strcmp(line, "BOARD") == 0 || strcmp(line, "BOARD?") == 0) {
+                send_board_status();
+                continue;
+            }
+
+            char board_arg[32];
+            if (sscanf(line, "BOARD %31s", board_arg) == 1) {
+                if (parse_board_auto_name(board_arg)) {
+                    board_type_t auto_board = g_auto_detected_board_type;
+                    bool needs_reboot = auto_board != g_board_type;
+
+                    if (g_board_select_source == BOARD_SELECT_SOURCE_AUTO && !needs_reboot) {
+                        cdc_write_line("OK BOARD AUTO UNCHANGED");
+                        continue;
+                    }
+
+                    if (!needs_reboot) {
+                        board_clear_persistent_override();
+                        g_board_select_source = BOARD_SELECT_SOURCE_AUTO;
+                        cdc_write_line("OK BOARD AUTO SAVED");
+                        continue;
+                    }
+
+                    const board_profile_t *profile = &BOARD_PROFILES[auto_board];
+                    char msg[128];
+                    snprintf(
+                        msg,
+                        sizeof(msg),
+                        "OK BOARD AUTO %s REBOOTING",
+                        profile->display_name
+                    );
+                    cdc_write_line(msg);
+                    board_clear_and_reboot();
+                }
+
+                board_type_t requested;
+                if (!parse_board_name(board_arg, &requested)) {
+                    cdc_write_line("ERR BOARD");
+                    continue;
+                }
+
+                const board_profile_t *profile = &BOARD_PROFILES[requested];
+                if (requested == g_board_type) {
+                    board_save_manual_override(requested);
+                    g_board_select_source = BOARD_SELECT_SOURCE_MANUAL;
+
+                    char msg[128];
+                    snprintf(
+                        msg,
+                        sizeof(msg),
+                        "OK BOARD %s SAVED",
+                        profile->display_name
+                    );
+                    cdc_write_line(msg);
+                    continue;
+                }
+
+                char msg[128];
+                snprintf(
+                    msg,
+                    sizeof(msg),
+                    "OK BOARD %s REBOOTING",
+                    profile->display_name
+                );
+                cdc_write_line(msg);
+                board_store_and_reboot(requested);
             }
 
             if (strcmp(line, "HEARTBEAT") == 0) {
@@ -1322,10 +1648,19 @@ int main(void) {
     tusb_init();
 
     g_hid_mode = read_requested_mode();
+    g_board_type = read_requested_board();
+
     pio_descs_set_mode(g_hid_mode);
     pio_descs_init();
 
-    const pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    const board_profile_t *profile = current_board_profile();
+    if (profile->pio_startup_delay_ms > 0) {
+        sleep_ms(profile->pio_startup_delay_ms);
+    }
+
+    pio_usb_configuration_t pio_cfg = PIO_USB_DEFAULT_CONFIG;
+    pio_cfg.pin_dp = profile->pio_usb_dp_pin;
+    pio_cfg.pin_dm = profile->pio_usb_dm_pin;
     (void)pio_usb_device_init(&pio_cfg, &pio_descs);
 
     g_last_heartbeat = get_absolute_time();

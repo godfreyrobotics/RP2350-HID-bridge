@@ -5,6 +5,7 @@
 
 typedef struct {
     uint8_t pin_dp;
+    uint8_t pin_dm;
     uint8_t pio_tx_num;
     uint8_t sm_tx;
     uint8_t tx_ch;
@@ -20,7 +21,9 @@ typedef struct {
 #define PIO_USB_DP_PIN_DEFAULT 28
 #endif
 
+#ifndef PIO_USB_DM_PIN_DEFAULT
 #define PIO_USB_DM_PIN_DEFAULT (PIO_USB_DP_PIN_DEFAULT + 1)
+#endif
 
 #define PIO_USB_TX_DEFAULT 0
 #define PIO_SM_USB_TX_DEFAULT 0
@@ -34,10 +37,10 @@ typedef struct {
 
 #define PIO_USB_DEFAULT_CONFIG                                                 \
   {                                                                            \
-    PIO_USB_DP_PIN_DEFAULT, PIO_USB_TX_DEFAULT, PIO_SM_USB_TX_DEFAULT,         \
-        PIO_USB_DMA_TX_DEFAULT, PIO_USB_RX_DEFAULT, PIO_SM_USB_RX_DEFAULT,     \
-        PIO_SM_USB_EOP_DEFAULT, NULL, PIO_USB_DEBUG_PIN_NONE,                  \
-        PIO_USB_DEBUG_PIN_NONE                                                 \
+    PIO_USB_DP_PIN_DEFAULT, PIO_USB_DM_PIN_DEFAULT, PIO_USB_TX_DEFAULT,        \
+        PIO_SM_USB_TX_DEFAULT, PIO_USB_DMA_TX_DEFAULT, PIO_USB_RX_DEFAULT,     \
+        PIO_SM_USB_RX_DEFAULT, PIO_SM_USB_EOP_DEFAULT, NULL,                   \
+        PIO_USB_DEBUG_PIN_NONE, PIO_USB_DEBUG_PIN_NONE                         \
   }
 
 #define PIO_USB_EP_POOL_CNT 32
