@@ -1,13 +1,15 @@
 # RP2350 HID Bridge
 
-Firmware for an RP2350-based computer-to-computer HID bridge that receives CDC commands on the native USB port and emulates USB HID output on the PIO USB port.
+Firmware for an RP2350-based computer-to-computer HID bridge that receives CDC commands on the native USB port and emulates USB HID output on a second USB interface implemented using PIO USB.
 
 ## Overview
 
-This project targets the **Waveshare RP2350-PiZero** and uses its dual-USB setup to bridge two computers:
+This project supports the **Waveshare RP2350-PiZero** and **Waveshare RP2350-USB-A** boards.
 
-- **Native USB port:** CDC command/control input
-- **PIO USB port:** HID output to the target computer
+The same firmware image can run on both boards using automatic board detection:
+
+- **Native USB interface:** CDC command/control input
+- **PIO USB interface:** HID output to the target computer
 
 A controller computer sends commands to the RP2350 over CDC, and the RP2350 appears to the target computer as a real USB input device.
 
@@ -17,8 +19,15 @@ The firmware supports multiple HID output modes, including a normal mouse/keyboa
 
 Typical connection model:
 
+### Waveshare RP2350-PiZero
+
 - **Controller computer** -> connected to the **native USB** port
 - **Target computer** -> connected to the **PIO USB** port
+
+### Waveshare RP2350-USB-A
+
+- **Controller computer** -> connected to the **native USB** port
+- **Target computer** -> connected to the **USB-A output connector**
 
 The controller computer sends text-based commands over CDC, and the target computer sees the RP2350 as a USB HID device.
 
@@ -29,6 +38,8 @@ For development and testing, the HID output can also be plugged back into the **
 ### HID output modes
 
 - RAM-selected HID output modes
+- Automatic board detection for supported Waveshare RP2350 boards
+- Optional persistent manual board profile override
 - Mode switching over CDC
 - Mode switching reboots the device so the PIO USB side can re-enumerate with a new HID descriptor
 - No flash writes are used for normal mode switching
@@ -136,6 +147,12 @@ The exact mount path may vary depending on your Linux distribution and desktop e
 
 Once the copy finishes, the board should automatically reboot into the new firmware.
 
+After flashing, the firmware should automatically detect the correct board profile. You can verify the active board profile with:
+
+```bash
+printf 'BOARD?\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
 ## USB architecture
 
 This project uses the board's two USB paths for separate roles:
@@ -149,6 +166,63 @@ This project uses the board's two USB paths for separate roles:
   - Sends mouse, keyboard, joystick/radio, or teleop HID reports to the target computer depending on the active mode
 
 This keeps the control channel separate from the HID output side.
+
+## Board selection
+
+The firmware supports automatic board detection and optional persistent manual board overrides.
+
+By default, the firmware attempts to select the correct board profile during boot. Current auto-detection uses detected flash size:
+
+- large flash, such as 16 MB -> Waveshare RP2350-PiZero
+- small flash, such as 2 MB -> Waveshare RP2350-USB-A
+
+Manual board commands are optional. They are useful if you want to force a profile or return to automatic detection after setting an override.
+
+### Board commands
+
+#### `BOARD?`
+
+Prints the current board profile, pin configuration, selection source, auto-detected board, and detected flash size.
+
+```text
+BOARD?
+```
+
+Example responses:
+
+```text
+BOARD waveshare_rp2350_usb_a dp=12 dm=13 source=auto auto=waveshare_rp2350_usb_a flash=2097152
+```
+
+```text
+BOARD waveshare_rp2350_pizero dp=28 dm=29 source=auto auto=waveshare_rp2350_pizero flash=16777216
+```
+
+#### `BOARD AUTO`
+
+Clears any persistent manual override and returns to automatic board detection.
+
+```text
+BOARD AUTO
+```
+
+#### `BOARD PIZERO`
+
+Persistently forces the Waveshare RP2350-PiZero board profile.
+
+```text
+BOARD PIZERO
+```
+
+#### `BOARD USBA`
+
+Persistently forces the Waveshare RP2350-USB-A board profile.
+
+```text
+BOARD USBA
+```
+
+Changing board profiles causes the RP2350 to reboot so that the PIO USB side can reinitialize using the correct USB pin configuration.
 
 ## HID output modes
 
@@ -656,6 +730,30 @@ These examples assume the CDC port is available as `/dev/ttyACM0`.
 printf 'STATUS\n' | sudo tee /dev/ttyACM0 > /dev/null
 ```
 
+### Check current board profile
+
+```bash
+printf 'BOARD?\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+### Return to automatic board detection
+
+```bash
+printf 'BOARD AUTO\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+### Force the RP2350-USB-A board profile
+
+```bash
+printf 'BOARD USBA\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
+### Force the RP2350-PiZero board profile
+
+```bash
+printf 'BOARD PIZERO\n' | sudo tee /dev/ttyACM0 > /dev/null
+```
+
 ### Check current HID mode
 
 ```bash
@@ -789,6 +887,7 @@ This helps prevent stuck keys, stuck modifiers, stuck mouse buttons, or stale co
 - Standard 6-key boot keyboard behavior only
 - Mode switching requires reboot/re-enumeration
 - `FULL` mode is experimental and may not be compatible with Windows games/simulators
+- Board auto-detection currently relies on flash size heuristics
 - Higher-level macros, motion planning, CV, and autonomy are intended to live on the controller computer, not in firmware
 
 ## Future work
@@ -798,12 +897,16 @@ This helps prevent stuck keys, stuck modifiers, stuck mouse buttons, or stale co
 - Improved FPV simulator host tooling
 - Host-side teleop configuration/mapping layer
 - Separate documentation for HID descriptors and report formats
+- Improved hardware-level board identification
+- Additional RP2350 board support
 
 ## Hardware
 
 - Waveshare RP2350-PiZero
+- Waveshare RP2350-USB-A
 
 ## Notes
 
 - Placeholder VID/PIDs are currently used for development
-- Mode switching is RAM-based and does not write to flash
+- HID mode switching is RAM-based and does not write to flash
+- Board overrides are persistent and stored separately from HID mode selection
