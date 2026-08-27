@@ -335,6 +335,20 @@ After switching modes, the CDC serial port may disconnect and reconnect.
 ## CDC command protocol
 
 Commands are sent as newline-terminated text lines over the CDC port.
+Responses are complete CRLF-terminated lines. The firmware buffers and drains
+long responses rather than relying on a single 64-byte USB transfer. Numeric
+commands require the documented number of integer arguments; malformed,
+overflowing, or extra arguments are rejected without changing HID state.
+
+The protocol is request/response except for safety events such as:
+
+```text
+WATCHDOG RESET
+```
+
+`STATUS` is not streamed periodically. A controller should therefore dispatch
+the explicitly identifiable asynchronous safety event separately from normal
+command responses.
 
 General form:
 
@@ -365,15 +379,38 @@ PING
 
 #### `STATUS`
 
-Returns current state/debug information.
+Returns one current state/debug line. No status lines are sent periodically.
 
 ```text
 STATUS
 ```
 
+#### `QUEUE?`
+
+Returns scheduled bridge-action depth and whether bridge output is active or
+idle. `idle=1` means there are no scheduled actions and no pending mouse or
+keyboard report waiting to be transmitted.
+
+```text
+QUEUE?
+```
+
+Example responses:
+
+```text
+QUEUE depth=37 active=1 idle=0
+QUEUE depth=0 active=0 idle=1
+```
+
 #### `HEARTBEAT`
 
 Refreshes the watchdog timeout.
+
+Every accepted command that changes or schedules target HID state also refreshes
+and re-arms the watchdog. Diagnostic queries such as `PING`, `STATUS`, `QUEUE?`,
+`MODE`, and `BOARD?` do not. Controllers should still send `HEARTBEAT`
+periodically while holding state or running actions longer than the two-second
+timeout.
 
 ```text
 HEARTBEAT
@@ -397,8 +434,12 @@ Performs immediate relative mouse movement. This command is **preemptive**: it c
 
 Parameters:
 
-- `dx`: relative X movement
-- `dy`: relative Y movement
+- `dx`: relative X movement, clamped to `-127..127`
+- `dy`: relative Y movement, clamped to `-127..127`
+
+The mouse HID descriptor uses signed 8-bit relative fields, so a single `MOVE`
+cannot transmit a larger delta exactly. For larger motion use `MOVE_SMOOTH`,
+which splits large deltas into multiple valid reports.
 
 Example:
 
@@ -409,6 +450,12 @@ MOVE 100 0
 ### `MOVE_SMOOTH dx dy duration_ms steps [curve] [overshoot] [jitter] [timing_jitter] [final_correct]`
 
 Performs smooth relative movement over time. This command is **preemptive**: it cancels any active smooth motion or drag plan before applying the new movement.
+
+Generated deltas larger than the signed 8-bit HID range are split into multiple
+reports while preserving their total displacement and allocated delay. If the
+complete path cannot fit in the queue, the command returns `ERR QUEUE_FULL` and
+none of the rejected path executes. Because the 512-slot ring buffer reserves
+one slot to distinguish full from empty, at most 511 actions can be pending.
 
 Parameters:
 
@@ -431,6 +478,9 @@ MOVE_SMOOTH 300 0 1000 40
 ### `DRAG button dx dy duration_ms steps [curve] [overshoot] [jitter] [timing_jitter] [final_correct]`
 
 Holds a mouse button and performs smooth relative movement. This command is **preemptive**: it cancels any active smooth motion or drag plan before applying the new movement.
+
+Drag construction is transactional. `ERR QUEUE_FULL` leaves the new drag
+unqueued and cannot leave its button pressed or logically owned.
 
 Parameters:
 
@@ -455,6 +505,9 @@ CANCEL_MOTION
 
 Performs one or more clicks.
 
+The whole click sequence is appended transactionally. `ERR QUEUE_FULL` means no
+prefix of the rejected click sequence was queued.
+
 Parameters:
 
 - `button`: button to click
@@ -473,7 +526,9 @@ CLICK 1 2 120 40 0 0
 
 ### `PRESS button`
 
-Presses and holds a mouse button.
+Presses and holds a mouse button. Explicit button-state commands preempt any
+scheduled click, smooth motion, or drag so queued work cannot later overwrite
+the requested state.
 
 Example:
 
@@ -483,7 +538,7 @@ PRESS 1
 
 ### `RELEASE button`
 
-Releases a mouse button.
+Releases a mouse button. This also preempts scheduled mouse actions.
 
 Example:
 
@@ -493,7 +548,8 @@ RELEASE 1
 
 ### `BUTTONS mask`
 
-Sets the full mouse button state directly.
+Sets the full mouse button state directly. The valid mask range is `0..31`.
+This also preempts scheduled mouse actions.
 
 Example:
 
@@ -508,8 +564,8 @@ Sends vertical and horizontal scroll input.
 
 Parameters:
 
-- `wheel`: vertical scroll
-- `pan`: horizontal scroll
+- `wheel`: vertical scroll, clamped to `-127..127`
+- `pan`: horizontal scroll, clamped to `-127..127`
 
 Examples:
 
@@ -870,13 +926,17 @@ printf 'TELEOP_AXIS 30 -1000\n' | sudo tee /dev/ttyACM0 > /dev/null
 This firmware is designed to fail in a safer way than blindly holding input state forever.
 
 - A controller can periodically send `HEARTBEAT`
-- If heartbeats stop, the watchdog can release active input state
+- Every accepted HID control command refreshes and re-arms the watchdog
+- If control activity and heartbeats stop for two seconds, the watchdog releases active input state
+- The watchdog re-arms after every later accepted control command, even if it tripped earlier
 - `RESET` releases all input state
 - `KEY_RESET` releases all keyboard state
 - `RADIO_RESET` resets radio channels to a safe state
 - `TELEOP_RESET` resets teleop axes to zero
 - `CANCEL_MOTION` stops active motion immediately
 - New motion commands are preemptive and replace older active motion plans
+- Explicit `PRESS`, `RELEASE`, and `BUTTONS` commands preempt queued mouse actions
+- Composite clicks, smooth paths, and drags are transactional on queue failure
 - Mouse button state can also be cleared explicitly with `BUTTONS 0`
 
 This helps prevent stuck keys, stuck modifiers, stuck mouse buttons, or stale controller state if the controller software crashes or disconnects.
@@ -884,11 +944,24 @@ This helps prevent stuck keys, stuck modifiers, stuck mouse buttons, or stale co
 ## Current limitations
 
 - Pointer movement is **relative-only** in firmware
+- One immediate mouse/scroll report is limited to signed 8-bit deltas (`-127..127`)
 - Standard 6-key boot keyboard behavior only
 - Mode switching requires reboot/re-enumeration
 - `FULL` mode is experimental and may not be compatible with Windows games/simulators
 - Board auto-detection currently relies on flash size heuristics
 - Higher-level macros, motion planning, CV, and autonomy are intended to live on the controller computer, not in firmware
+
+## Host regression tests
+
+The reliability-critical queue, parser, CDC framing, watchdog, and smooth-motion
+logic can be tested without RP2350 hardware using a host C compiler:
+
+```bash
+tests/run_host_tests.sh
+```
+
+These tests do not replace a Pico SDK firmware build or the documented physical
+CDC/HID loopback checks after flashing.
 
 ## Future work
 
