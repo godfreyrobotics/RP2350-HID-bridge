@@ -4,7 +4,12 @@
 #include <string.h>
 #include <stdlib.h>
 #include <math.h>
+#include <limits.h>
+#include <errno.h>
 
+#ifdef HID_BRIDGE_HOST_TEST
+#include "../tests/host_test_stubs.h"
+#else
 #include "pico/stdlib.h"
 #include "hardware/watchdog.h"
 #include "hardware/structs/watchdog.h"
@@ -17,6 +22,7 @@
 #include "pio_usb_configuration.h"
 #include "usb_definitions.h"
 #include "hid_modes.h"
+#endif
 
 extern usb_descriptor_buffers_t pio_descs;
 void pio_descs_init(void);
@@ -24,6 +30,8 @@ void pio_descs_set_mode(hid_mode_t mode);
 bool pio_usb_device_transfer(uint8_t ep_address, uint8_t *buffer, uint16_t buflen);
 
 #define CDC_LINE_BUF_SIZE 384
+#define CDC_TX_QUEUE_SIZE 2048
+#define CDC_TX_COMMAND_RESERVE 512
 #define HEARTBEAT_TIMEOUT_MS 2000
 #define ACTION_QUEUE_SIZE 512
 
@@ -162,19 +170,24 @@ static board_select_source_t g_board_select_source = BOARD_SELECT_SOURCE_AUTO;
 static uint32_t g_detected_flash_size_bytes = 0;
 static char g_line_buf[CDC_LINE_BUF_SIZE];
 static size_t g_line_len = 0;
+static bool g_discard_line_until_newline = false;
+static char g_cdc_tx_queue[CDC_TX_QUEUE_SIZE];
+static uint16_t g_cdc_tx_head = 0;
+static uint16_t g_cdc_tx_tail = 0;
 static absolute_time_t g_last_heartbeat;
-static absolute_time_t g_last_status;
 static bool g_watchdog_tripped = false;
 
 static action_t g_queue[ACTION_QUEUE_SIZE];
 static uint16_t g_q_head = 0;
 static uint16_t g_q_tail = 0;
-static uint32_t g_queue_deadline_ms = 0;
+static absolute_time_t g_queue_deadline;
+static bool g_queue_deadline_set = false;
 static bool g_motion_owns_button = false;
 static uint8_t g_motion_owned_mask = 0;
 
 static void mouse_mark_button_state(uint8_t buttons);
 static void cdc_write_line(const char *s);
+static void service_cdc_tx(void);
 
 static inline int8_t clamp_i8(int v) {
     if (v < -127) return -127;
@@ -413,18 +426,15 @@ static void send_board_status(void) {
     cdc_write_line(msg);
 }
 
-static inline uint32_t now_ms(void) {
-    return to_ms_since_boot(get_absolute_time());
-}
-
 static int rand_range(int min_v, int max_v) {
     if (max_v < min_v) {
         int t = min_v;
         min_v = max_v;
         max_v = t;
     }
-    uint32_t span = (uint32_t)(max_v - min_v + 1);
-    return min_v + (int)(rand() % span);
+    uint64_t span = (uint64_t)((int64_t)max_v - (int64_t)min_v) + 1u;
+    uint32_t random_value = ((uint32_t)rand() << 16) ^ (uint32_t)rand();
+    return (int)((int64_t)min_v + (int64_t)((uint64_t)random_value % span));
 }
 
 static float rand_float(float a, float b) {
@@ -432,12 +442,62 @@ static float rand_float(float a, float b) {
     return a + (b - a) * r;
 }
 
-static void cdc_write_line(const char *s) {
-    if (tud_cdc_connected()) {
-        tud_cdc_write_str(s);
-        tud_cdc_write_str("\r\n");
-        tud_cdc_write_flush();
+static uint16_t cdc_tx_depth(void) {
+    return (uint16_t)((g_cdc_tx_tail + CDC_TX_QUEUE_SIZE - g_cdc_tx_head) % CDC_TX_QUEUE_SIZE);
+}
+
+static uint16_t cdc_tx_available(void) {
+    return (uint16_t)((CDC_TX_QUEUE_SIZE - 1) - cdc_tx_depth());
+}
+
+static void cdc_tx_clear(void) {
+    g_cdc_tx_head = 0;
+    g_cdc_tx_tail = 0;
+}
+
+static bool cdc_tx_enqueue(const char *data, size_t length) {
+    if (length > cdc_tx_available()) return false;
+
+    for (size_t index = 0; index < length; ++index) {
+        g_cdc_tx_queue[g_cdc_tx_tail] = data[index];
+        g_cdc_tx_tail = (uint16_t)((g_cdc_tx_tail + 1) % CDC_TX_QUEUE_SIZE);
     }
+    return true;
+}
+
+static void service_cdc_tx(void) {
+    if (!tud_cdc_connected()) {
+        cdc_tx_clear();
+        return;
+    }
+
+    while (g_cdc_tx_head != g_cdc_tx_tail) {
+        uint32_t available = tud_cdc_write_available();
+        if (available == 0) break;
+
+        uint16_t contiguous = g_cdc_tx_tail > g_cdc_tx_head
+                                  ? (uint16_t)(g_cdc_tx_tail - g_cdc_tx_head)
+                                  : (uint16_t)(CDC_TX_QUEUE_SIZE - g_cdc_tx_head);
+        uint32_t chunk = contiguous < available ? contiguous : available;
+        uint32_t written = tud_cdc_write(&g_cdc_tx_queue[g_cdc_tx_head], chunk);
+        if (written == 0) break;
+        g_cdc_tx_head = (uint16_t)((g_cdc_tx_head + written) % CDC_TX_QUEUE_SIZE);
+    }
+
+    tud_cdc_write_flush();
+}
+
+static void cdc_write_line(const char *s) {
+    if (!tud_cdc_connected()) return;
+
+    size_t length = strlen(s);
+    if (length + 2 > cdc_tx_available()) {
+        return;  // Drop the whole line rather than emit a truncated protocol frame.
+    }
+
+    (void)cdc_tx_enqueue(s, length);
+    (void)cdc_tx_enqueue("\r\n", 2);
+    service_cdc_tx();
 }
 
 static bool queue_empty(void) {
@@ -446,6 +506,14 @@ static bool queue_empty(void) {
 
 static bool queue_full(void) {
     return ((g_q_tail + 1) % ACTION_QUEUE_SIZE) == g_q_head;
+}
+
+static uint16_t queue_depth(void) {
+    return (uint16_t)((g_q_tail + ACTION_QUEUE_SIZE - g_q_head) % ACTION_QUEUE_SIZE);
+}
+
+static uint16_t queue_available(void) {
+    return (uint16_t)((ACTION_QUEUE_SIZE - 1) - queue_depth());
 }
 
 static bool queue_push(action_t a) {
@@ -470,7 +538,32 @@ static void queue_pop(void) {
 static void queue_clear(void) {
     g_q_head = 0;
     g_q_tail = 0;
-    g_queue_deadline_ms = 0;
+    g_queue_deadline_set = false;
+}
+
+static uint16_t queue_checkpoint(void) {
+    return g_q_tail;
+}
+
+static void queue_rollback(uint16_t checkpoint) {
+    g_q_tail = checkpoint;
+}
+
+static uint8_t queue_projected_buttons(void) {
+    uint8_t buttons = g_mouse.buttons;
+    uint16_t index = g_q_head;
+
+    while (index != g_q_tail) {
+        const action_t *action = &g_queue[index];
+        if (action->type == ACT_SET_BUTTONS || action->type == ACT_REPORT_REL) {
+            buttons = action->buttons;
+        } else if (action->type == ACT_RESET_ALL) {
+            buttons = 0;
+        }
+        index = (uint16_t)((index + 1) % ACTION_QUEUE_SIZE);
+    }
+
+    return buttons;
 }
 
 static void release_motion_owned_button_if_needed(void) {
@@ -618,6 +711,28 @@ static void hid_release_all(void) {
     teleop_reset();
 }
 
+static void watchdog_note_control_activity(void) {
+    g_last_heartbeat = get_absolute_time();
+    g_watchdog_tripped = false;
+}
+
+static bool bridge_output_idle(void) {
+    return queue_empty() && !g_mouse.dirty && !g_kbd.dirty;
+}
+
+static void send_queue_status(void) {
+    char msg[96];
+    snprintf(
+        msg,
+        sizeof(msg),
+        "QUEUE depth=%u active=%u idle=%u",
+        (unsigned)queue_depth(),
+        bridge_output_idle() ? 0u : 1u,
+        bridge_output_idle() ? 1u : 0u
+    );
+    cdc_write_line(msg);
+}
+
 static void send_status(void) {
     char msg[256];
     snprintf(
@@ -633,7 +748,7 @@ static void send_status(void) {
         g_kbd.modifiers,
         g_kbd.keycodes[0], g_kbd.keycodes[1], g_kbd.keycodes[2],
         g_kbd.keycodes[3], g_kbd.keycodes[4], g_kbd.keycodes[5],
-        (unsigned)((g_q_tail + ACTION_QUEUE_SIZE - g_q_head) % ACTION_QUEUE_SIZE),
+        (unsigned)queue_depth(),
         g_radio.buttons,
         g_teleop.sequence
     );
@@ -668,6 +783,57 @@ static bool enqueue_report_after(uint32_t delay_ms, uint8_t buttons, int dx, int
         .pan = clamp_i8(pan)
     };
     return queue_push(a);
+}
+
+static uint32_t relative_report_chunk_count(int dx, int dy, int wheel, int pan) {
+    int64_t values[] = {dx, dy, wheel, pan};
+    uint64_t largest = 0;
+
+    for (size_t idx = 0; idx < sizeof(values) / sizeof(values[0]); ++idx) {
+        uint64_t magnitude = values[idx] < 0 ? (uint64_t)(-values[idx]) : (uint64_t)values[idx];
+        if (magnitude > largest) largest = magnitude;
+    }
+
+    if (largest == 0) return 1;
+    return (uint32_t)((largest + 126u) / 127u);
+}
+
+static bool enqueue_report_split_after(uint32_t delay_ms,
+                                       uint8_t buttons,
+                                       int dx,
+                                       int dy,
+                                       int wheel,
+                                       int pan) {
+    uint32_t chunks = relative_report_chunk_count(dx, dy, wheel, pan);
+    if (chunks > queue_available()) return false;
+
+    int remaining_dx = dx;
+    int remaining_dy = dy;
+    int remaining_wheel = wheel;
+    int remaining_pan = pan;
+    uint32_t remaining_delay = delay_ms;
+
+    for (uint32_t index = 0; index < chunks; ++index) {
+        uint32_t chunks_left = chunks - index;
+        uint32_t action_delay = remaining_delay / chunks_left;
+        int action_dx = remaining_dx / (int)chunks_left;
+        int action_dy = remaining_dy / (int)chunks_left;
+        int action_wheel = remaining_wheel / (int)chunks_left;
+        int action_pan = remaining_pan / (int)chunks_left;
+
+        if (!enqueue_report_after(action_delay, buttons,
+                                  action_dx, action_dy, action_wheel, action_pan)) {
+            return false;
+        }
+
+        remaining_delay -= action_delay;
+        remaining_dx -= action_dx;
+        remaining_dy -= action_dy;
+        remaining_wheel -= action_wheel;
+        remaining_pan -= action_pan;
+    }
+
+    return true;
 }
 
 static bool button_valid(int n) {
@@ -743,13 +909,28 @@ static bool enqueue_smooth_path(uint8_t held_buttons,
     if (overshoot_strength < 0) overshoot_strength = 0;
     if (jitter_strength < 0) jitter_strength = 0;
 
+    if (steps > queue_available()) return false;
+
+    int64_t max_encodable_displacement = (int64_t)queue_available() * 127;
+    if ((int64_t)total_dx > max_encodable_displacement ||
+        (int64_t)total_dx < -max_encodable_displacement ||
+        (int64_t)total_dy > max_encodable_displacement ||
+        (int64_t)total_dy < -max_encodable_displacement) {
+        return false;
+    }
+
+    if (curve_strength > 1000) curve_strength = 1000;
+    if (overshoot_strength > 1000) overshoot_strength = 1000;
+    if (jitter_strength > 1000) jitter_strength = 1000;
+    if (timing_jitter_ms > 60000) timing_jitter_ms = 60000;
+
     vec2f_t start = {0.0f, 0.0f};
     vec2f_t end = {(float)total_dx, (float)total_dy};
     vec2f_t d = vec_sub(end, start);
     float dist = vec_len(d);
 
     if (dist < 0.5f) {
-        return enqueue_report_after(0, held_buttons, total_dx, total_dy, 0, 0);
+        return enqueue_report_split_after(0, held_buttons, total_dx, total_dy, 0, 0);
     }
 
     vec2f_t dir = vec_norm(d);
@@ -814,7 +995,6 @@ static bool enqueue_smooth_path(uint8_t held_buttons,
     vec2f_t prev = start;
     uint32_t base_dt = (uint32_t)(duration_ms / steps);
     if (base_dt < 1) base_dt = 1;
-    bool ok = true;
 
     for (int i = 1; i <= main_steps; i++) {
         float t = (float)i / (float)main_steps;
@@ -832,10 +1012,14 @@ static bool enqueue_smooth_path(uint8_t held_buttons,
         int step_dx = (int)lroundf(p.x - prev.x);
         int step_dy = (int)lroundf(p.y - prev.y);
 
-        int dt = (int)base_dt + rand_range(-timing_jitter_ms, timing_jitter_ms);
+        int64_t dt = (int64_t)base_dt + rand_range(-timing_jitter_ms, timing_jitter_ms);
         if (dt < 1) dt = 1;
+        if (dt > UINT32_MAX) dt = UINT32_MAX;
 
-        ok &= enqueue_report_after((uint32_t)dt, held_buttons, step_dx, step_dy, 0, 0);
+        if (!enqueue_report_split_after((uint32_t)dt, held_buttons,
+                                        step_dx, step_dy, 0, 0)) {
+            return false;
+        }
         prev = vec_add(prev, (vec2f_t){(float)step_dx, (float)step_dy});
     }
 
@@ -858,10 +1042,14 @@ static bool enqueue_smooth_path(uint8_t held_buttons,
             int step_dx = (int)lroundf(p.x - prev.x);
             int step_dy = (int)lroundf(p.y - prev.y);
 
-            int dt = (int)corr_dt + rand_range(-timing_jitter_ms, timing_jitter_ms);
+            int64_t dt = (int64_t)corr_dt + rand_range(-timing_jitter_ms, timing_jitter_ms);
             if (dt < 1) dt = 1;
+            if (dt > UINT32_MAX) dt = UINT32_MAX;
 
-            ok &= enqueue_report_after((uint32_t)dt, held_buttons, step_dx, step_dy, 0, 0);
+            if (!enqueue_report_split_after((uint32_t)dt, held_buttons,
+                                            step_dx, step_dy, 0, 0)) {
+                return false;
+            }
             prev = vec_add(prev, (vec2f_t){(float)step_dx, (float)step_dy});
         }
     }
@@ -870,11 +1058,14 @@ static bool enqueue_smooth_path(uint8_t held_buttons,
         int final_dx = total_dx - (int)lroundf(prev.x);
         int final_dy = total_dy - (int)lroundf(prev.y);
         if (final_dx != 0 || final_dy != 0) {
-            ok &= enqueue_report_after(1, held_buttons, final_dx, final_dy, 0, 0);
+            if (!enqueue_report_split_after(1, held_buttons,
+                                            final_dx, final_dy, 0, 0)) {
+                return false;
+            }
         }
     }
 
-    return ok;
+    return true;
 }
 
 
@@ -888,8 +1079,9 @@ static int parse_int_tokens(char *line, int *values, int max_values) {
         }
 
         char *end = NULL;
+        errno = 0;
         long v = strtol(tok, &end, 0);
-        if (end == tok || *end != '\0') {
+        if (errno == ERANGE || end == tok || *end != '\0' || v < INT_MIN || v > INT_MAX) {
             return -1;
         }
         values[count++] = (int)v;
@@ -898,16 +1090,28 @@ static int parse_int_tokens(char *line, int *values, int max_values) {
     return count;
 }
 
-static bool parse_prefixed_ints(const char *line, const char *prefix, int *values, int max_values, int *count_out) {
-    size_t n = strlen(prefix);
-    if (strncmp(line, prefix, n) != 0) return false;
-    if (line[n] != '\0' && line[n] != ' ' && line[n] != '\t') return false;
+enum {
+    PARSE_INTS_INVALID = -1,
+    PARSE_INTS_NO_MATCH = -2,
+};
+
+static int parse_command_ints(const char *line, const char *command, int *values, int max_values) {
+    size_t command_length = strlen(command);
+    if (strncmp(line, command, command_length) != 0) return PARSE_INTS_NO_MATCH;
+    if (line[command_length] != '\0' &&
+        line[command_length] != ' ' &&
+        line[command_length] != '\t') {
+        return PARSE_INTS_NO_MATCH;
+    }
 
     char tmp[CDC_LINE_BUF_SIZE];
-    strncpy(tmp, line + n, sizeof(tmp) - 1);
+    strncpy(tmp, line + command_length, sizeof(tmp) - 1);
     tmp[sizeof(tmp) - 1] = '\0';
+    return parse_int_tokens(tmp, values, max_values);
+}
 
-    int count = parse_int_tokens(tmp, values, max_values);
+static bool parse_prefixed_ints(const char *line, const char *prefix, int *values, int max_values, int *count_out) {
+    int count = parse_command_ints(line, prefix, values, max_values);
     if (count < 0) return false;
     *count_out = count;
     return true;
@@ -934,9 +1138,18 @@ static bool parse_mode_name(const char *s, hid_mode_t *mode_out) {
 }
 
 static void service_cdc_rx(void) {
-    while (tud_cdc_available()) {
+    while (tud_cdc_available() &&
+           (g_discard_line_until_newline || cdc_tx_available() >= CDC_TX_COMMAND_RESERVE)) {
         uint8_t ch;
         if (tud_cdc_read(&ch, 1) != 1) break;
+
+        if (g_discard_line_until_newline) {
+            if (ch == '\n') {
+                g_discard_line_until_newline = false;
+                g_line_len = 0;
+            }
+            continue;
+        }
 
         if (ch == '\r') continue;
 
@@ -955,6 +1168,11 @@ static void service_cdc_rx(void) {
 
             if (strcmp(line, "STATUS") == 0) {
                 send_status();
+                continue;
+            }
+
+            if (strcmp(line, "QUEUE?") == 0) {
+                send_queue_status();
                 continue;
             }
 
@@ -1051,14 +1269,14 @@ static void service_cdc_rx(void) {
             }
 
             if (strcmp(line, "HEARTBEAT") == 0) {
-                g_last_heartbeat = get_absolute_time();
-                g_watchdog_tripped = false;
+                watchdog_note_control_activity();
                 cdc_write_line("OK HEARTBEAT");
                 continue;
             }
 
             if (strcmp(line, "RESET") == 0) {
                 hid_release_all();
+                watchdog_note_control_activity();
                 cdc_write_line("OK RESET");
                 continue;
             }
@@ -1069,6 +1287,7 @@ static void service_cdc_rx(void) {
                     continue;
                 }
                 preempt_motion_plan(true);
+                watchdog_note_control_activity();
                 cdc_write_line("OK CANCEL_MOTION");
                 continue;
             }
@@ -1079,6 +1298,7 @@ static void service_cdc_rx(void) {
                     continue;
                 }
                 radio_reset();
+                watchdog_note_control_activity();
                 cdc_write_line("OK RADIO_RESET");
                 continue;
             }
@@ -1089,6 +1309,7 @@ static void service_cdc_rx(void) {
                     continue;
                 }
                 teleop_reset();
+                watchdog_note_control_activity();
                 cdc_write_line("OK TELEOP_RESET");
                 continue;
             }
@@ -1109,6 +1330,7 @@ static void service_cdc_rx(void) {
                     g_radio.axes[n] = (n < value_count) ? cdc_axis_to_hid_i16(values[n]) : 0;
                 }
                 radio_mark_dirty();
+                watchdog_note_control_activity();
                 cdc_write_line("OK RADIO");
                 continue;
             }
@@ -1124,6 +1346,7 @@ static void service_cdc_rx(void) {
                 }
                 g_radio.buttons = (uint16_t)values[0];
                 radio_mark_dirty();
+                watchdog_note_control_activity();
                 cdc_write_line("OK RADIO_BUTTONS");
                 continue;
             }
@@ -1139,6 +1362,7 @@ static void service_cdc_rx(void) {
                 }
                 g_radio.buttons |= radio_button_mask(values[0]);
                 radio_mark_dirty();
+                watchdog_note_control_activity();
                 cdc_write_line("OK RADIO_PRESS");
                 continue;
             }
@@ -1154,6 +1378,7 @@ static void service_cdc_rx(void) {
                 }
                 g_radio.buttons &= (uint16_t)~radio_button_mask(values[0]);
                 radio_mark_dirty();
+                watchdog_note_control_activity();
                 cdc_write_line("OK RADIO_RELEASE");
                 continue;
             }
@@ -1171,6 +1396,7 @@ static void service_cdc_rx(void) {
                 g_teleop.axes[axis] = cdc_axis_to_hid_i16(values[1]);
                 teleop_bump_sequence();
                 teleop_mark_bank_dirty(axis / TELEOP_AXES_PER_BANK);
+                watchdog_note_control_activity();
                 cdc_write_line("OK TELEOP_AXIS");
                 continue;
             }
@@ -1192,73 +1418,91 @@ static void service_cdc_rx(void) {
                 }
                 teleop_bump_sequence();
                 teleop_mark_bank_dirty(bank);
+                watchdog_note_control_activity();
                 cdc_write_line("OK TELEOP_BANK");
                 continue;
             }
 
-            int a = 0, b = 0, c = 0, d = 0, e = 0, f = 0, g = 0, h = 0, i = 0;
-
-            if (sscanf(line, "MOVE %d %d", &a, &b) == 2) {
+            int parsed_move = parse_command_ints(line, "MOVE", values, 2);
+            if (parsed_move != PARSE_INTS_NO_MATCH) {
+                if (parsed_move != 2) { cdc_write_line("ERR MOVE_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 preempt_motion_plan(true);
-                mouse_mark_report(g_mouse.buttons, a, b, 0, 0);
+                mouse_mark_report(g_mouse.buttons, values[0], values[1], 0, 0);
+                watchdog_note_control_activity();
                 cdc_write_line("OK MOVE");
                 continue;
             }
 
-            if (sscanf(line, "SCROLL %d %d", &a, &b) == 2) {
+            int parsed_scroll = parse_command_ints(line, "SCROLL", values, 2);
+            if (parsed_scroll != PARSE_INTS_NO_MATCH) {
+                if (parsed_scroll != 2) { cdc_write_line("ERR SCROLL_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                mouse_mark_report(g_mouse.buttons, 0, 0, a, b);
+                mouse_mark_report(g_mouse.buttons, 0, 0, values[0], values[1]);
+                watchdog_note_control_activity();
                 cdc_write_line("OK SCROLL");
                 continue;
             }
 
-            if (sscanf(line, "BUTTONS %d", &a) == 1) {
+            int parsed_buttons = parse_command_ints(line, "BUTTONS", values, 1);
+            if (parsed_buttons != PARSE_INTS_NO_MATCH) {
+                if (parsed_buttons != 1) { cdc_write_line("ERR BUTTONS_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                g_motion_owns_button = false;
-                g_motion_owned_mask = 0;
-                mouse_mark_button_state((uint8_t)(a & 0x1F));
+                if (values[0] < 0 || values[0] > 0x1F) {
+                    cdc_write_line("ERR BUTTONS_MASK");
+                    continue;
+                }
+                preempt_motion_plan(true);
+                mouse_mark_button_state((uint8_t)values[0]);
+                watchdog_note_control_activity();
                 cdc_write_line("OK BUTTONS");
                 continue;
             }
 
-            if (sscanf(line, "PRESS %d", &a) == 1) {
+            int parsed_press = parse_command_ints(line, "PRESS", values, 1);
+            if (parsed_press != PARSE_INTS_NO_MATCH) {
+                if (parsed_press != 1) { cdc_write_line("ERR PRESS_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                if (!button_valid(a)) {
+                if (!button_valid(values[0])) {
                     cdc_write_line("ERR BUTTON");
                     continue;
                 }
-                g_motion_owns_button = false;
-                g_motion_owned_mask = 0;
-                mouse_mark_button_state((uint8_t)(g_mouse.buttons | button_mask(a)));
+                preempt_motion_plan(true);
+                mouse_mark_button_state((uint8_t)(g_mouse.buttons | button_mask(values[0])));
+                watchdog_note_control_activity();
                 cdc_write_line("OK PRESS");
                 continue;
             }
 
-            if (sscanf(line, "RELEASE %d", &a) == 1) {
+            int parsed_release = parse_command_ints(line, "RELEASE", values, 1);
+            if (parsed_release != PARSE_INTS_NO_MATCH) {
+                if (parsed_release != 1) { cdc_write_line("ERR RELEASE_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                if (!button_valid(a)) {
+                if (!button_valid(values[0])) {
                     cdc_write_line("ERR BUTTON");
                     continue;
                 }
-                if (g_motion_owns_button && (g_motion_owned_mask & button_mask(a))) {
-                    g_motion_owns_button = false;
-                    g_motion_owned_mask = 0;
-                }
-                mouse_mark_button_state((uint8_t)(g_mouse.buttons & (uint8_t)~button_mask(a)));
+                preempt_motion_plan(true);
+                mouse_mark_button_state((uint8_t)(g_mouse.buttons &
+                                                  (uint8_t)~button_mask(values[0])));
+                watchdog_note_control_activity();
                 cdc_write_line("OK RELEASE");
                 continue;
             }
 
-            int parsed_click = sscanf(line, "CLICK %d %d %d %d %d %d", &a, &b, &c, &d, &e, &f);
-            if (parsed_click >= 1) {
+            int parsed_click = parse_command_ints(line, "CLICK", values, 6);
+            if (parsed_click != PARSE_INTS_NO_MATCH) {
+                if (parsed_click < 1) {
+                    cdc_write_line("ERR CLICK_ARGS");
+                    continue;
+                }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                int button = a;
-                int count = (parsed_click >= 2) ? b : 1;
-                int interval_ms = (parsed_click >= 3) ? c : 120;
-                int hold_ms = (parsed_click >= 4) ? d : 30;
-                int interval_jitter_ms = (parsed_click >= 5) ? e : 0;
-                int hold_jitter_ms = (parsed_click >= 6) ? f : 0;
+                int button = values[0];
+                int count = (parsed_click >= 2) ? values[1] : 1;
+                int interval_ms = (parsed_click >= 3) ? values[2] : 120;
+                int hold_ms = (parsed_click >= 4) ? values[3] : 30;
+                int interval_jitter_ms = (parsed_click >= 5) ? values[4] : 0;
+                int hold_jitter_ms = (parsed_click >= 6) ? values[5] : 0;
 
                 if (!button_valid(button)) {
                     cdc_write_line("ERR BUTTON");
@@ -1270,67 +1514,103 @@ static void service_cdc_rx(void) {
                 if (interval_jitter_ms < 0) interval_jitter_ms = 0;
                 if (hold_jitter_ms < 0) hold_jitter_ms = 0;
 
-                uint8_t base_buttons = g_mouse.buttons;
+                uint64_t required_actions = (uint64_t)count * 3u - 1u;
+                if (required_actions > queue_available()) {
+                    cdc_write_line("ERR QUEUE_FULL");
+                    continue;
+                }
+
+                uint8_t base_buttons = queue_projected_buttons();
                 uint8_t click_mask = button_mask(button);
+                uint16_t checkpoint = queue_checkpoint();
 
                 bool ok = true;
                 for (int n = 0; n < count; n++) {
-                    int actual_hold = hold_ms + rand_range(-hold_jitter_ms, hold_jitter_ms);
+                    int64_t actual_hold = (int64_t)hold_ms +
+                                          rand_range(-hold_jitter_ms, hold_jitter_ms);
                     if (actual_hold < 10) actual_hold = 10;
+                    if (actual_hold > UINT32_MAX) actual_hold = UINT32_MAX;
 
-                    ok &= enqueue_set_buttons_after(0, (uint8_t)(base_buttons | click_mask));
-                    ok &= enqueue_set_buttons_after((uint32_t)actual_hold, base_buttons);
+                    if (!enqueue_set_buttons_after(0, (uint8_t)(base_buttons | click_mask)) ||
+                        !enqueue_set_buttons_after((uint32_t)actual_hold, base_buttons)) {
+                        ok = false;
+                        break;
+                    }
 
                     if (n != count - 1) {
-                        int actual_interval = interval_ms + rand_range(-interval_jitter_ms, interval_jitter_ms);
+                        int64_t actual_interval = (int64_t)interval_ms +
+                                                  rand_range(-interval_jitter_ms, interval_jitter_ms);
                         if (actual_interval < 20) actual_interval = 20;
-                        ok &= enqueue_delay((uint32_t)actual_interval);
+                        if (actual_interval > UINT32_MAX) actual_interval = UINT32_MAX;
+                        if (!enqueue_delay((uint32_t)actual_interval)) {
+                            ok = false;
+                            break;
+                        }
                     }
                 }
 
+                if (!ok) {
+                    queue_rollback(checkpoint);
+                } else {
+                    watchdog_note_control_activity();
+                }
                 cdc_write_line(ok ? "OK CLICK" : "ERR QUEUE_FULL");
                 continue;
             }
 
-            int parsed_smooth = sscanf(line,
-                                       "MOVE_SMOOTH %d %d %d %d %d %d %d %d %d",
-                                       &a, &b, &c, &d, &e, &f, &g, &h, &i);
-            if (parsed_smooth >= 4) {
+            int parsed_smooth = parse_command_ints(line, "MOVE_SMOOTH", values, 9);
+            if (parsed_smooth != PARSE_INTS_NO_MATCH) {
+                if (parsed_smooth < 4) {
+                    cdc_write_line("ERR MOVE_SMOOTH_ARGS");
+                    continue;
+                }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                int dx = a;
-                int dy = b;
-                int duration_ms = c;
-                int steps = d;
-                int curve = (parsed_smooth >= 5) ? e : 6;
-                int overshoot = (parsed_smooth >= 6) ? f : 4;
-                int jitter = (parsed_smooth >= 7) ? g : 2;
-                int timing_jitter = (parsed_smooth >= 8) ? h : 1;
-                bool final_correct = (parsed_smooth >= 9) ? (i != 0) : false;
+                int dx = values[0];
+                int dy = values[1];
+                int duration_ms = values[2];
+                int steps = values[3];
+                int curve = (parsed_smooth >= 5) ? values[4] : 6;
+                int overshoot = (parsed_smooth >= 6) ? values[5] : 4;
+                int jitter = (parsed_smooth >= 7) ? values[6] : 2;
+                int timing_jitter = (parsed_smooth >= 8) ? values[7] : 1;
+                bool final_correct = (parsed_smooth >= 9) ? (values[8] != 0) : false;
 
                 preempt_motion_plan(true);
+                uint16_t checkpoint = queue_checkpoint();
                 bool ok = enqueue_smooth_path(g_mouse.buttons, dx, dy, duration_ms, steps,
                                               curve, overshoot, jitter, timing_jitter, final_correct);
+                if (!ok) {
+                    queue_rollback(checkpoint);
+                    mouse_release_all();
+                } else {
+                    watchdog_note_control_activity();
+                }
                 cdc_write_line(ok ? "OK MOVE_SMOOTH" : "ERR QUEUE_FULL");
                 continue;
             }
 
-            int btn, dx, dy, duration_ms, steps, curve, overshoot, jitter, timing_jitter, final_correct_i;
-            int parsed_drag = sscanf(line,
-                                     "DRAG %d %d %d %d %d %d %d %d %d %d",
-                                     &btn, &dx, &dy, &duration_ms, &steps,
-                                     &curve, &overshoot, &jitter, &timing_jitter, &final_correct_i);
-            if (parsed_drag >= 5) {
+            int parsed_drag = parse_command_ints(line, "DRAG", values, 10);
+            if (parsed_drag != PARSE_INTS_NO_MATCH) {
+                if (parsed_drag < 5) {
+                    cdc_write_line("ERR DRAG_ARGS");
+                    continue;
+                }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
+                int btn = values[0];
+                int dx = values[1];
+                int dy = values[2];
+                int duration_ms = values[3];
+                int steps = values[4];
+                int curve = (parsed_drag >= 6) ? values[5] : 6;
+                int overshoot = (parsed_drag >= 7) ? values[6] : 3;
+                int jitter = (parsed_drag >= 8) ? values[7] : 2;
+                int timing_jitter = (parsed_drag >= 9) ? values[8] : 1;
+                bool final_correct = (parsed_drag >= 10) ? (values[9] != 0) : false;
+
                 if (!button_valid(btn)) {
                     cdc_write_line("ERR BUTTON");
                     continue;
                 }
-
-                if (parsed_drag < 6) curve = 6;
-                if (parsed_drag < 7) overshoot = 3;
-                if (parsed_drag < 8) jitter = 2;
-                if (parsed_drag < 9) timing_jitter = 1;
-                bool final_correct = (parsed_drag >= 10) ? (final_correct_i != 0) : false;
 
                 preempt_motion_plan(true);
 
@@ -1340,62 +1620,76 @@ static void service_cdc_rx(void) {
                 g_motion_owns_button = true;
                 g_motion_owned_mask = button_mask(btn);
 
-                bool ok = true;
-                ok &= enqueue_set_buttons_after(0, drag_buttons);
-                ok &= enqueue_smooth_path(drag_buttons, dx, dy, duration_ms, steps,
-                                          curve, overshoot, jitter, timing_jitter, final_correct);
-                ok &= enqueue_set_buttons_after(1, base_buttons);
+                uint16_t checkpoint = queue_checkpoint();
+                bool ok = enqueue_set_buttons_after(0, drag_buttons) &&
+                          enqueue_smooth_path(drag_buttons, dx, dy, duration_ms, steps,
+                                              curve, overshoot, jitter, timing_jitter, final_correct) &&
+                          enqueue_set_buttons_after(1, base_buttons);
 
                 if (!ok) {
-                    g_motion_owns_button = false;
-                    g_motion_owned_mask = 0;
+                    queue_rollback(checkpoint);
+                    mouse_release_all();
+                } else {
+                    watchdog_note_control_activity();
                 }
 
                 cdc_write_line(ok ? "OK DRAG" : "ERR QUEUE_FULL");
                 continue;
             }
 
-            int k0, k1, k2, k3, k4, k5, k6;
-
-            if (sscanf(line, "KEY_PRESS %d", &a) == 1) {
+            int parsed_key_press = parse_command_ints(line, "KEY_PRESS", values, 1);
+            if (parsed_key_press != PARSE_INTS_NO_MATCH) {
+                if (parsed_key_press != 1) { cdc_write_line("ERR KEY_PRESS_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                if (a < 0 || a > 0x65) {
+                if (values[0] < 0 || values[0] > 0x65) {
                     cdc_write_line("ERR KEYCODE");
                     continue;
                 }
-                cdc_write_line(keyboard_add_key((uint8_t)a) ? "OK KEY_PRESS" : "ERR KEY_SLOTS_FULL");
+                bool ok = keyboard_add_key((uint8_t)values[0]);
+                if (ok) watchdog_note_control_activity();
+                cdc_write_line(ok ? "OK KEY_PRESS" : "ERR KEY_SLOTS_FULL");
                 continue;
             }
 
-            if (sscanf(line, "KEY_RELEASE %d", &a) == 1) {
+            int parsed_key_release = parse_command_ints(line, "KEY_RELEASE", values, 1);
+            if (parsed_key_release != PARSE_INTS_NO_MATCH) {
+                if (parsed_key_release != 1) { cdc_write_line("ERR KEY_RELEASE_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                if (a < 0 || a > 0x65) {
+                if (values[0] < 0 || values[0] > 0x65) {
                     cdc_write_line("ERR KEYCODE");
                     continue;
                 }
-                keyboard_remove_key((uint8_t)a);
+                keyboard_remove_key((uint8_t)values[0]);
+                watchdog_note_control_activity();
                 cdc_write_line("OK KEY_RELEASE");
                 continue;
             }
 
-            if (sscanf(line, "MOD_PRESS %d", &a) == 1) {
+            int parsed_mod_press = parse_command_ints(line, "MOD_PRESS", values, 1);
+            if (parsed_mod_press != PARSE_INTS_NO_MATCH) {
+                if (parsed_mod_press != 1) { cdc_write_line("ERR MOD_PRESS_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                if (a < 0 || a > 0xFF) {
+                if (values[0] < 0 || values[0] > 0xFF) {
                     cdc_write_line("ERR MODMASK");
                     continue;
                 }
-                keyboard_set_modifiers((uint8_t)(g_kbd.modifiers | (uint8_t)a));
+                keyboard_set_modifiers((uint8_t)(g_kbd.modifiers | (uint8_t)values[0]));
+                watchdog_note_control_activity();
                 cdc_write_line("OK MOD_PRESS");
                 continue;
             }
 
-            if (sscanf(line, "MOD_RELEASE %d", &a) == 1) {
+            int parsed_mod_release = parse_command_ints(line, "MOD_RELEASE", values, 1);
+            if (parsed_mod_release != PARSE_INTS_NO_MATCH) {
+                if (parsed_mod_release != 1) { cdc_write_line("ERR MOD_RELEASE_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                if (a < 0 || a > 0xFF) {
+                if (values[0] < 0 || values[0] > 0xFF) {
                     cdc_write_line("ERR MODMASK");
                     continue;
                 }
-                keyboard_set_modifiers((uint8_t)(g_kbd.modifiers & (uint8_t)(~(uint8_t)a)));
+                keyboard_set_modifiers((uint8_t)(g_kbd.modifiers &
+                                                 (uint8_t)(~(uint8_t)values[0])));
+                watchdog_note_control_activity();
                 cdc_write_line("OK MOD_RELEASE");
                 continue;
             }
@@ -1403,31 +1697,35 @@ static void service_cdc_rx(void) {
             if (strcmp(line, "KEY_RESET") == 0) {
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
                 keyboard_release_all();
+                watchdog_note_control_activity();
                 cdc_write_line("OK KEY_RESET");
                 continue;
             }
 
-            if (sscanf(line, "KEYBOARD %d %d %d %d %d %d %d", &k0, &k1, &k2, &k3, &k4, &k5, &k6) == 7) {
+            int parsed_keyboard = parse_command_ints(line, "KEYBOARD", values, 7);
+            if (parsed_keyboard != PARSE_INTS_NO_MATCH) {
+                if (parsed_keyboard != 7) { cdc_write_line("ERR KEYBOARD_ARGS"); continue; }
                 if (!mode_supports_bridge()) { cdc_write_line("ERR MODE_UNSUPPORTED"); continue; }
-                if (k0 < 0 || k0 > 0xFF ||
-                    k1 < 0 || k1 > 0x65 ||
-                    k2 < 0 || k2 > 0x65 ||
-                    k3 < 0 || k3 > 0x65 ||
-                    k4 < 0 || k4 > 0x65 ||
-                    k5 < 0 || k5 > 0x65 ||
-                    k6 < 0 || k6 > 0x65) {
+                if (values[0] < 0 || values[0] > 0xFF ||
+                    values[1] < 0 || values[1] > 0x65 ||
+                    values[2] < 0 || values[2] > 0x65 ||
+                    values[3] < 0 || values[3] > 0x65 ||
+                    values[4] < 0 || values[4] > 0x65 ||
+                    values[5] < 0 || values[5] > 0x65 ||
+                    values[6] < 0 || values[6] > 0x65) {
                     cdc_write_line("ERR KEYBOARD_STATE");
                     continue;
                 }
 
-                g_kbd.modifiers = (uint8_t)k0;
-                g_kbd.keycodes[0] = (uint8_t)k1;
-                g_kbd.keycodes[1] = (uint8_t)k2;
-                g_kbd.keycodes[2] = (uint8_t)k3;
-                g_kbd.keycodes[3] = (uint8_t)k4;
-                g_kbd.keycodes[4] = (uint8_t)k5;
-                g_kbd.keycodes[5] = (uint8_t)k6;
+                g_kbd.modifiers = (uint8_t)values[0];
+                g_kbd.keycodes[0] = (uint8_t)values[1];
+                g_kbd.keycodes[1] = (uint8_t)values[2];
+                g_kbd.keycodes[2] = (uint8_t)values[3];
+                g_kbd.keycodes[3] = (uint8_t)values[4];
+                g_kbd.keycodes[4] = (uint8_t)values[5];
+                g_kbd.keycodes[5] = (uint8_t)values[6];
                 keyboard_mark_dirty();
+                watchdog_note_control_activity();
                 cdc_write_line("OK KEYBOARD");
                 continue;
             }
@@ -1440,6 +1738,7 @@ static void service_cdc_rx(void) {
             g_line_buf[g_line_len++] = (char)ch;
         } else {
             g_line_len = 0;
+            g_discard_line_until_newline = true;
             cdc_write_line("ERR LINE_TOO_LONG");
         }
     }
@@ -1460,11 +1759,12 @@ static void service_action_queue(void) {
 
     if (!queue_peek(&a)) return;
 
-    if (g_queue_deadline_ms == 0) {
-        g_queue_deadline_ms = now_ms() + a.delay_ms;
+    if (!g_queue_deadline_set) {
+        g_queue_deadline = make_timeout_time_ms(a.delay_ms);
+        g_queue_deadline_set = true;
     }
 
-    if (now_ms() < g_queue_deadline_ms) {
+    if (!time_reached(g_queue_deadline)) {
         return;
     }
 
@@ -1500,7 +1800,7 @@ static void service_action_queue(void) {
     }
 
     queue_pop();
-    g_queue_deadline_ms = 0;
+    g_queue_deadline_set = false;
 }
 
 static void service_pio_mouse_tx(void) {
@@ -1643,6 +1943,7 @@ static void service_pio_hid_tx(void) {
     }
 }
 
+#ifndef HID_BRIDGE_HOST_TEST
 int main(void) {
     stdio_init_all();
     tusb_init();
@@ -1664,7 +1965,6 @@ int main(void) {
     (void)pio_usb_device_init(&pio_cfg, &pio_descs);
 
     g_last_heartbeat = get_absolute_time();
-    g_last_status = get_absolute_time();
 
     srand((unsigned)time_us_32());
     radio_reset();
@@ -1674,6 +1974,8 @@ int main(void) {
         tud_task();
         pio_usb_device_task();
 
+        service_cdc_tx();
+
         if (tud_cdc_connected()) {
             service_cdc_rx();
         }
@@ -1681,11 +1983,7 @@ int main(void) {
         service_watchdog();
         service_action_queue();
         service_pio_hid_tx();
-
-        if (tud_cdc_connected() &&
-            absolute_time_diff_us(g_last_status, get_absolute_time()) <= -1000000) {
-            g_last_status = get_absolute_time();
-            send_status();
-        }
+        service_cdc_tx();
     }
 }
+#endif
